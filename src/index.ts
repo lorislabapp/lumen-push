@@ -27,7 +27,7 @@ interface FrigateWebhook {
   after: FrigateEvent | null;
 }
 
-function parseRoute(url: URL): { endpoint: string; secret: string; token: string; cam: string | null } | null {
+function parseRoute(url: URL): { endpoint: string; secret: string; token: string; cam: string | null; sandbox: boolean } | null {
   const match = url.pathname.match(/^\/v1\/(notify|test)\/([0-9a-fA-F]{32})\/([0-9a-fA-F]{32,128})$/);
   if (!match) return null;
   return {
@@ -35,6 +35,7 @@ function parseRoute(url: URL): { endpoint: string; secret: string; token: string
     secret: match[2],
     token: match[3],
     cam: url.searchParams.get("cam"),
+    sandbox: url.searchParams.get("sandbox") === "1",
   };
 }
 
@@ -60,14 +61,14 @@ export default {
     }
 
     if (route.endpoint === "test") {
-      return handleTest(route.token, env);
+      return handleTest(route.token, route.sandbox, env);
     }
 
     return handleNotify(request, route, env);
   },
 };
 
-async function handleTest(token: string, env: Env): Promise<Response> {
+async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Response> {
   const testKey = `test:${token}`;
   const lastTest = await env.RATE_LIMIT.get(testKey);
   if (lastTest) {
@@ -87,13 +88,13 @@ async function handleTest(token: string, env: Env): Promise<Response> {
     source: "cloudflare-relay-test",
   };
 
-  await sendAPNs(token, payload, env);
+  await sendAPNs(token, payload, sandbox, env);
   return new Response("OK", { status: 200 });
 }
 
 async function handleNotify(
   request: Request,
-  route: { secret: string; token: string; cam: string | null },
+  route: { secret: string; token: string; cam: string | null; sandbox: boolean },
   env: Env
 ): Promise<Response> {
   let body: FrigateWebhook;
@@ -165,7 +166,7 @@ async function handleNotify(
     source: "cloudflare-relay",
   };
 
-  await sendAPNs(route.token, apnsPayload, env);
+  await sendAPNs(route.token, apnsPayload, route.sandbox, env);
   return new Response("OK", { status: 200 });
 }
 
@@ -221,7 +222,9 @@ async function getAPNsJWT(env: Env): Promise<string> {
     new TextEncoder().encode(signingInput)
   );
 
-  const rawSig = derToRaw(new Uint8Array(signature));
+  const sigBytes = new Uint8Array(signature);
+  // Web Crypto may return raw r||s (64 bytes) or DER-encoded (70-72 bytes)
+  const rawSig = sigBytes.length === 64 ? sigBytes : derToRaw(sigBytes);
   const jwt = `${signingInput}.${base64url(rawSig)}`;
 
   cachedJWT = { token: jwt, expiry: now + 3000 };
@@ -248,12 +251,13 @@ function derToRaw(der: Uint8Array): Uint8Array {
   return raw;
 }
 
-async function sendAPNs(token: string, payload: unknown, env: Env): Promise<void> {
+async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: Env): Promise<void> {
   try {
     const jwt = await getAPNsJWT(env);
+    const apnsHost = sandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
 
     const response = await fetch(
-      `https://api.push.apple.com/3/device/${token}`,
+      `https://${apnsHost}/3/device/${token}`,
       {
         method: "POST",
         headers: {
@@ -275,3 +279,4 @@ async function sendAPNs(token: string, payload: unknown, env: Env): Promise<void
     console.error(`APNs request failed: ${e}`);
   }
 }
+
