@@ -256,6 +256,10 @@ async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: 
     const jwt = await getAPNsJWT(env);
     const apnsHost = sandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
 
+    // apns-expiration: retry for 1h on transient delivery failures
+    // (device offline, asleep, low-power). `0` would drop immediately.
+    const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+
     const response = await fetch(
       `https://${apnsHost}/3/device/${token}`,
       {
@@ -265,7 +269,7 @@ async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: 
           "apns-push-type": "alert",
           "apns-topic": env.APNS_BUNDLE_ID,
           "apns-priority": "10",
-          "apns-expiration": "0",
+          "apns-expiration": String(expiresAt),
           "content-type": "application/json",
         },
         body: JSON.stringify(payload),
@@ -273,7 +277,8 @@ async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: 
     );
 
     if (!response.ok) {
-      console.error(`APNs error: ${response.status}`);
+      const errText = await response.text().catch(() => "");
+      console.error(`APNs error ${response.status}: ${errText}`);
     }
   } catch (e) {
     console.error(`APNs request failed: ${e}`);
