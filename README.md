@@ -12,7 +12,7 @@ Frigate NVR
       |  MQTT event: frigate/events  (Frigate does not send HTTP webhooks natively)
       v
 lumen-push-relay (this is a small container you run on your network)
-      |  https://github.com/lorislabfr/lumen-push-relay
+      |  https://github.com/lorislabapp/lumen-push-relay
       |  1. Subscribes to Frigate MQTT
       |  2. Filters: labels, zones, confidence, cooldown, schedule
       |  3. POSTs a compact JSON payload to the Cloudflare Worker
@@ -35,7 +35,7 @@ User sees notification (typically <1s end-to-end)
 
 ## How it works
 
-1. You run [`lumen-push-relay`](https://github.com/lorislabfr/lumen-push-relay) alongside Frigate — a small Python/Docker container that subscribes to Frigate's MQTT events.
+1. You run [`lumen-push-relay`](https://github.com/lorislabapp/lumen-push-relay) alongside Frigate — a small Python/Docker container that subscribes to Frigate's MQTT events.
 2. When Frigate detects something, the relay filters the event and POSTs a compact JSON payload to this Cloudflare Worker.
 3. The Worker validates, rate limits, signs an APNs JWT, and delivers the push to Apple.
 4. Your iPhone / iPad / Mac / Watch / Apple TV / Vision Pro receives the notification via Lumen.
@@ -130,7 +130,7 @@ You can deploy your own instance of this worker to Cloudflare:
 
 1. Clone this repo:
 ```bash
-git clone https://github.com/lorislabfr/lumen-push.git
+git clone https://github.com/lorislabapp/lumen-push.git
 cd lumen-push
 npm install
 ```
@@ -180,6 +180,6 @@ MIT
 
 - [Lumen for Frigate](https://apps.apple.com/app/id6760238729) — Native Apple companion app for Frigate NVR
 - [LumenTV](https://apps.apple.com/app/id6760317319) — Lumen for Apple TV
-- [lumen-push-relay](https://github.com/lorislabfr/lumen-push-relay) — MQTT→Worker bridge (the thing most users need to run)
+- [lumen-push-relay](https://github.com/lorislabapp/lumen-push-relay) — MQTT→Worker bridge (the thing most users need to run)
 - [Frigate NVR](https://github.com/blakeblackshear/frigate) — Open-source AI-powered NVR
 - [LorisLabs](https://lorislab.fr) — Developer website
