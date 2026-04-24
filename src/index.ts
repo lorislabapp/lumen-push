@@ -4,6 +4,10 @@ export interface Env {
   APNS_TEAM_ID: string;
   APNS_BUNDLE_ID: string;
   KILL_SWITCH: string;
+  // Maximum age (seconds) of a Frigate event we will forward to APNs. Older
+  // events are dropped as stale (MQTT replay, relay backlog, etc.). Set to "0"
+  // to disable. Defaults to 120 if unset.
+  MAX_EVENT_AGE_SECONDS?: string;
   RATE_LIMIT: KVNamespace;
 }
 
@@ -125,6 +129,21 @@ async function handleNotify(
     return new Response("OK", { status: 200 });
   }
 
+  // Drop stale events. Guards against MQTT replay, relay backlog, or any
+  // upstream queue that could produce a "fake-fresh" push for something that
+  // actually happened hours ago. `start_time` is Unix epoch seconds. We skip
+  // the check when start_time is missing/zero so malformed events still get
+  // forwarded (matches relay.py behavior).
+  const maxAgeStr = env.MAX_EVENT_AGE_SECONDS ?? "120";
+  const maxAge = parseInt(maxAgeStr, 10);
+  if (maxAge > 0 && typeof event.start_time === "number" && event.start_time > 0) {
+    const ageSeconds = Date.now() / 1000 - event.start_time;
+    if (ageSeconds > maxAge) {
+      console.log(`Dropping stale event ${event.id}: age=${ageSeconds.toFixed(0)}s max=${maxAge}s`);
+      return new Response("OK", { status: 200 });
+    }
+  }
+
   // Rate limit via KV (30s per token)
   const rateKey = `rl:${route.token}`;
   const lastPush = await env.RATE_LIMIT.get(rateKey);
@@ -163,6 +182,10 @@ async function handleNotify(
     camera: event.camera,
     label: event.label,
     zones: event.zones || [],
+    // Unix epoch seconds of Frigate detection. The NSE uses this to show the
+    // user "detected Xs ago" so real-time pushes can be visually distinguished
+    // from pushes APNs held while the device was unreachable.
+    detected_at: event.start_time,
     source: "cloudflare-relay",
   };
 
