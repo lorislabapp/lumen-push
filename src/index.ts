@@ -9,6 +9,23 @@ export interface Env {
   // to disable. Defaults to 120 if unset.
   MAX_EVENT_AGE_SECONDS?: string;
   RATE_LIMIT: KVNamespace;
+  // Phase 1 multi-device fan-out: maps `secret` -> list of registered devices.
+  // Populated via POST /v1/register. Consumed by handleNotify to fan out
+  // a single Frigate event to every device that shares the secret. If empty
+  // for a given secret, handleNotify falls back to the single token in the
+  // URL (backward compatibility with pre-fan-out clients).
+  DEVICES: KVNamespace;
+}
+
+/**
+ * One device record stored in the DEVICES KV under key `devices:{secret}`.
+ * Values are stored as a JSON array of RegisteredDevice.
+ */
+interface RegisteredDevice {
+  token: string;        // APNs device token (hex)
+  sandbox: boolean;     // true for DEBUG builds (APNs sandbox), false for App Store
+  platform?: string;    // "ios" | "macos" | "watchos" | "visionos" | "tvos"
+  registered_at: number; // Unix epoch seconds
 }
 
 interface FrigateEvent {
@@ -31,8 +48,8 @@ interface FrigateWebhook {
   after: FrigateEvent | null;
 }
 
-function parseRoute(url: URL): { endpoint: string; secret: string; token: string; cam: string | null; sandbox: boolean } | null {
-  const match = url.pathname.match(/^\/v1\/(notify|test)\/([0-9a-fA-F]{32})\/([0-9a-fA-F]{32,128})$/);
+function parseRoute(url: URL): { endpoint: string; secret: string; token: string; cam: string | null; sandbox: boolean; platform: string | null } | null {
+  const match = url.pathname.match(/^\/v1\/(notify|test|register|unregister)\/([0-9a-fA-F]{32})\/([0-9a-fA-F]{32,128})$/);
   if (!match) return null;
   return {
     endpoint: match[1],
@@ -40,6 +57,7 @@ function parseRoute(url: URL): { endpoint: string; secret: string; token: string
     token: match[3],
     cam: url.searchParams.get("cam"),
     sandbox: url.searchParams.get("sandbox") === "1",
+    platform: url.searchParams.get("platform"),
   };
 }
 
@@ -68,9 +86,85 @@ export default {
       return handleTest(route.token, route.sandbox, env);
     }
 
+    if (route.endpoint === "register") {
+      return handleRegister(route, env);
+    }
+
+    if (route.endpoint === "unregister") {
+      return handleUnregister(route, env);
+    }
+
     return handleNotify(request, route, env);
   },
 };
+
+// --- Device registry (Phase 1 multi-device fan-out) ---
+
+/** Max devices per secret. Guards against accidental runaway registration. */
+const MAX_DEVICES_PER_SECRET = 16;
+
+async function readDevices(secret: string, env: Env): Promise<RegisteredDevice[]> {
+  const raw = await env.DEVICES.get(`devices:${secret}`);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw) as RegisteredDevice[];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeDevices(secret: string, list: RegisteredDevice[], env: Env): Promise<void> {
+  await env.DEVICES.put(`devices:${secret}`, JSON.stringify(list));
+}
+
+async function handleRegister(
+  route: { secret: string; token: string; sandbox: boolean; platform: string | null },
+  env: Env
+): Promise<Response> {
+  const devices = await readDevices(route.secret, env);
+
+  // Upsert: if token already in list, update its metadata; else append.
+  const existingIdx = devices.findIndex((d) => d.token === route.token);
+  const record: RegisteredDevice = {
+    token: route.token,
+    sandbox: route.sandbox,
+    platform: route.platform ?? undefined,
+    registered_at: Math.floor(Date.now() / 1000),
+  };
+
+  if (existingIdx >= 0) {
+    devices[existingIdx] = record;
+  } else {
+    if (devices.length >= MAX_DEVICES_PER_SECRET) {
+      // Evict oldest by registered_at to keep list bounded.
+      devices.sort((a, b) => a.registered_at - b.registered_at);
+      devices.shift();
+    }
+    devices.push(record);
+  }
+
+  await writeDevices(route.secret, devices, env);
+  return new Response(
+    JSON.stringify({ ok: true, device_count: devices.length }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+async function handleUnregister(
+  route: { secret: string; token: string },
+  env: Env
+): Promise<Response> {
+  const devices = await readDevices(route.secret, env);
+  const filtered = devices.filter((d) => d.token !== route.token);
+  if (filtered.length !== devices.length) {
+    await writeDevices(route.secret, filtered, env);
+  }
+  return new Response(
+    JSON.stringify({ ok: true, device_count: filtered.length }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
 
 async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Response> {
   const testKey = `test:${token}`;
@@ -144,17 +238,6 @@ async function handleNotify(
     }
   }
 
-  // Rate limit via KV (30s per token)
-  const rateKey = `rl:${route.token}`;
-  const lastPush = await env.RATE_LIMIT.get(rateKey);
-  if (lastPush) {
-    const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
-    if (elapsed < 30) {
-      return new Response("OK", { status: 200 });
-    }
-  }
-  await env.RATE_LIMIT.put(rateKey, String(Date.now()), { expirationTtl: 120 });
-
   // Build APNs payload
   const cameraName = event.camera.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   const label = event.label.replace(/\b\w/g, (c) => c.toUpperCase());
@@ -189,8 +272,46 @@ async function handleNotify(
     source: "cloudflare-relay",
   };
 
-  await sendAPNs(route.token, apnsPayload, route.sandbox, env);
+  // Phase 1 fan-out: look up all devices registered under this secret. If the
+  // user has registered via POST /v1/register (iPhone + iPad + Mac + Watch...),
+  // fan out to every one in parallel. Each device has its own 30s rate-limit
+  // bucket so one spammy camera doesn't block a new device from receiving.
+  //
+  // If no devices are registered (pre-fan-out client still using the single
+  // URL token), fall back to that URL token so existing setups keep working.
+  const registered = await readDevices(route.secret, env);
+  const targets: RegisteredDevice[] = registered.length > 0
+    ? registered
+    : [{ token: route.token, sandbox: route.sandbox, registered_at: 0 }];
+
+  await Promise.all(
+    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, env))
+  );
+
   return new Response("OK", { status: 200 });
+}
+
+/**
+ * Send the APNs payload to one device, honouring a per-token 30s rate limit.
+ * Returns silently if rate-limited or if APNs errors — errors are logged in
+ * sendAPNs. This way one failing device does not block other targets in the
+ * same Promise.all fan-out.
+ */
+async function sendToDeviceRateLimited(
+  device: RegisteredDevice,
+  payload: unknown,
+  env: Env
+): Promise<void> {
+  const rateKey = `rl:${device.token}`;
+  const lastPush = await env.RATE_LIMIT.get(rateKey);
+  if (lastPush) {
+    const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
+    if (elapsed < 30) {
+      return;
+    }
+  }
+  await env.RATE_LIMIT.put(rateKey, String(Date.now()), { expirationTtl: 120 });
+  await sendAPNs(device.token, payload, device.sandbox, env);
 }
 
 // --- APNs JWT signing and delivery ---

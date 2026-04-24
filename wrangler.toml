@@ -5,3 +5,7 @@ compatibility_date = "2024-01-01"
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "103f9f605ffa41588382f0537b8c55ae"
+
+[[kv_namespaces]]
+binding = "DEVICES"
+id = "505b10887ac844338b94b7340906865e"
