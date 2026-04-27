@@ -26,6 +26,20 @@ export interface Env {
   // blob4=label, blob5=outcome ("sent"|"rate_limited"), blob6=platform.
   // double1=count(=1), double2=top_score. index1=tokenPrefix.
   NOTIF_STATS?: AnalyticsEngineDataset;
+  // GET /stats?token=… page. Required for the HTML dashboard. Generated with
+  // openssl rand -hex 32 and set via `wrangler secret put STATS_TOKEN`.
+  STATS_TOKEN?: string;
+  // Account ID used to call the Analytics Engine SQL API. Plain var (not a
+  // secret — it's already in the URL of any wrangler deploy).
+  CF_ACCOUNT_ID?: string;
+  // CF API token with Account Analytics:Read scope. Used by /stats and the
+  // daily Cron digest to query the NOTIF_STATS dataset. Set via
+  // `wrangler secret put CF_ANALYTICS_TOKEN`.
+  CF_ANALYTICS_TOKEN?: string;
+  // Slack incoming webhook URL. Optional — if absent, the Cron handler
+  // skips Slack delivery (no-op). Set via
+  // `wrangler secret put SLACK_WEBHOOK_URL` once the webhook is created.
+  SLACK_WEBHOOK_URL?: string;
 }
 
 /**
@@ -78,11 +92,18 @@ export default {
       return new Response("Service temporarily disabled", { status: 503 });
     }
 
+    const url = new URL(request.url);
+
+    // Stats dashboard (GET, secret-guarded). Lives outside the POST-only
+    // /v1/* surface because it's a read-only diagnostic page.
+    if (request.method === "GET" && url.pathname === "/stats") {
+      return handleStats(request, env);
+    }
+
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
     }
 
-    const url = new URL(request.url);
     const route = parseRoute(url);
     if (!route) {
       return new Response("Bad request", { status: 400 });
@@ -110,6 +131,20 @@ export default {
     // located. Used for per-country notification stats.
     const country = request.headers.get("CF-IPCountry") ?? "??";
     return handleNotify(request, route, country, env);
+  },
+
+  // Daily Cron-triggered Slack digest. Wired in wrangler.toml as
+  // `0 8 * * *` (08:00 UTC = 09:00 Paris winter / 10:00 summer).
+  // No-ops if SLACK_WEBHOOK_URL is unset, which is the safe default
+  // until the operator adds the secret.
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    if (!env.SLACK_WEBHOOK_URL) return;
+    if (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN) return;
+    try {
+      await postSlackDigest(env);
+    } catch (e) {
+      console.error(`Slack digest failed: ${e}`);
+    }
   },
 };
 
@@ -541,5 +576,384 @@ async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: 
   } catch (e) {
     console.error(`APNs request failed: ${e}`);
   }
+}
+
+// --- Stats dashboard + Slack digest ---
+
+/**
+ * Run a SQL query against the Workers Analytics Engine HTTP API and return
+ * the parsed `data` rows. Returns [] on any failure (network, auth, schema
+ * drift). Errors are logged but never propagated — the dashboard falls back
+ * to an empty section rather than 500'ing.
+ */
+async function runAnalyticsQuery<T = Record<string, unknown>>(
+  env: Env,
+  sql: string
+): Promise<T[]> {
+  if (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN) return [];
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.CF_ANALYTICS_TOKEN}`,
+          "Content-Type": "text/plain",
+        },
+        body: sql,
+      }
+    );
+    if (!res.ok) {
+      console.error(`Analytics query failed ${res.status}: ${await res.text().catch(() => "")}`);
+      return [];
+    }
+    const json = await res.json<{ data?: T[] }>();
+    return Array.isArray(json.data) ? json.data : [];
+  } catch (e) {
+    console.error(`Analytics query exception: ${e}`);
+    return [];
+  }
+}
+
+interface StatsBundle {
+  totals: { sent: number; rate_limited: number; users: number };
+  perCountry: Array<{ country: string; notifs: number }>;
+  perDay: Array<{ day: string; notifs: number; users: number }>;
+  perPlatform: Array<{ platform: string; notifs: number }>;
+  topCameras: Array<{ camera: string; notifs: number }>;
+  topUsers: Array<{ user: string; country: string; notifs: number }>;
+}
+
+async function loadStats(env: Env): Promise<StatsBundle> {
+  // Note: Workers Analytics Engine reweights sampled rows via _sample_interval.
+  // For our tokenPrefix-indexed dataset (low cardinality) sampling is rare,
+  // but using SUM(_sample_interval) is the supported correct-count idiom.
+  const ds = "lumen_push_notif_stats";
+
+  const [totalsRows, perCountry, perDay, perPlatform, topCameras, topUsers] =
+    await Promise.all([
+      runAnalyticsQuery<{ outcome: string; n: number; users: number }>(
+        env,
+        `SELECT blob5 AS outcome,
+                SUM(_sample_interval) AS n,
+                uniq(blob1) AS users
+         FROM ${ds}
+         WHERE timestamp > NOW() - INTERVAL '7' DAY
+         GROUP BY outcome`
+      ),
+      runAnalyticsQuery<{ country: string; notifs: number }>(
+        env,
+        `SELECT blob2 AS country, SUM(_sample_interval) AS notifs
+         FROM ${ds}
+         WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob5 = 'sent'
+         GROUP BY country ORDER BY notifs DESC LIMIT 20`
+      ),
+      runAnalyticsQuery<{ day: string; notifs: number; users: number }>(
+        env,
+        `SELECT formatDateTime(timestamp, '%F') AS day,
+                SUM(_sample_interval) AS notifs,
+                uniq(blob1) AS users
+         FROM ${ds}
+         WHERE timestamp > NOW() - INTERVAL '30' DAY AND blob5 = 'sent'
+         GROUP BY day ORDER BY day`
+      ),
+      runAnalyticsQuery<{ platform: string; notifs: number }>(
+        env,
+        `SELECT blob6 AS platform, SUM(_sample_interval) AS notifs
+         FROM ${ds}
+         WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob5 = 'sent'
+         GROUP BY platform ORDER BY notifs DESC`
+      ),
+      runAnalyticsQuery<{ camera: string; notifs: number }>(
+        env,
+        `SELECT blob3 AS camera, SUM(_sample_interval) AS notifs
+         FROM ${ds}
+         WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob5 = 'sent'
+         GROUP BY camera ORDER BY notifs DESC LIMIT 10`
+      ),
+      runAnalyticsQuery<{ user: string; country: string; notifs: number }>(
+        env,
+        `SELECT blob1 AS user, any(blob2) AS country, SUM(_sample_interval) AS notifs
+         FROM ${ds}
+         WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob5 = 'sent'
+         GROUP BY user ORDER BY notifs DESC LIMIT 20`
+      ),
+    ]);
+
+  let sent = 0,
+    rateLimited = 0,
+    users = 0;
+  for (const r of totalsRows) {
+    if (r.outcome === "sent") {
+      sent = Number(r.n) || 0;
+      users = Number(r.users) || 0;
+    } else if (r.outcome === "rate_limited") {
+      rateLimited = Number(r.n) || 0;
+    }
+  }
+
+  return {
+    totals: { sent, rate_limited: rateLimited, users },
+    perCountry,
+    perDay,
+    perPlatform,
+    topCameras,
+    topUsers,
+  };
+}
+
+async function handleStats(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const provided = url.searchParams.get("token");
+  if (!env.STATS_TOKEN || provided !== env.STATS_TOKEN) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  // JSON view for tooling/automation
+  if (url.searchParams.get("format") === "json") {
+    const stats = await loadStats(env);
+    return new Response(JSON.stringify(stats, null, 2), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const stats = await loadStats(env);
+  const html = renderStatsHTML(stats);
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
+}
+
+function escapeHTML(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderStatsHTML(s: StatsBundle): string {
+  const t = s.totals;
+  const dropPct = t.sent + t.rate_limited > 0
+    ? ((t.rate_limited / (t.sent + t.rate_limited)) * 100).toFixed(1)
+    : "0.0";
+
+  const j = (x: unknown) => JSON.stringify(x);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Lumen Push — Stats</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" integrity="sha384-mpe1RaT6FBvxyrM9Pq5IiqsB7mcOQunEyjoDyW3nPOM48v6yKnmkHX+oyU2u8M3v" crossorigin="anonymous" defer></script>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  background: #0a0c10; color: #e7eaee; padding: 24px; max-width: 1200px; margin: 0 auto;
+}
+h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
+.sub { color: #8a93a3; font-size: 13px; margin-bottom: 24px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 24px; }
+.card {
+  background: #131720; border: 1px solid #20262f; border-radius: 12px; padding: 16px;
+}
+.card h2 { font-size: 12px; font-weight: 500; color: #8a93a3; margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+.kpi { font-size: 28px; font-weight: 600; color: #f5f7fa; }
+.kpi small { font-size: 13px; color: #8a93a3; font-weight: 400; margin-left: 6px; }
+.section { background: #131720; border: 1px solid #20262f; border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+.section h2 { font-size: 13px; font-weight: 600; color: #c9cfd8; margin: 0 0 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+.section .chart-wrap { position: relative; height: 240px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #20262f; }
+th { color: #8a93a3; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; color: #f5f7fa; }
+tr:last-child td { border-bottom: none; }
+.empty { color: #5a6373; font-style: italic; padding: 12px 0; }
+.flag { display: inline-block; min-width: 32px; font-weight: 600; }
+.row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 720px) { .row-2 { grid-template-columns: 1fr; } }
+.token { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: #c9cfd8; }
+footer { color: #5a6373; font-size: 12px; text-align: center; margin-top: 24px; }
+</style>
+</head>
+<body>
+<h1>Lumen Push — Notification Stats</h1>
+<div class="sub">Last 7 days · auto-refreshes when you reload.</div>
+
+<div class="grid">
+  <div class="card"><h2>Sent</h2><div class="kpi">${t.sent.toLocaleString()}<small>pushes</small></div></div>
+  <div class="card"><h2>Unique Users</h2><div class="kpi">${t.users.toLocaleString()}<small>devices</small></div></div>
+  <div class="card"><h2>Rate-Limited</h2><div class="kpi">${t.rate_limited.toLocaleString()}<small>${dropPct}% drop</small></div></div>
+</div>
+
+<div class="row-2">
+  <div class="section">
+    <h2>Daily Trend (30d)</h2>
+    <div class="chart-wrap"><canvas id="dailyChart"></canvas></div>
+  </div>
+  <div class="section">
+    <h2>By Platform</h2>
+    <div class="chart-wrap"><canvas id="platformChart"></canvas></div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>By Country</h2>
+  ${
+    s.perCountry.length === 0
+      ? '<div class="empty">No data yet.</div>'
+      : `<table><thead><tr><th>Country</th><th class="num">Notifs (7d)</th></tr></thead><tbody>${s.perCountry
+          .map(
+            (r) =>
+              `<tr><td><span class="flag">${escapeHTML(r.country)}</span></td><td class="num">${Number(r.notifs).toLocaleString()}</td></tr>`
+          )
+          .join("")}</tbody></table>`
+  }
+</div>
+
+<div class="row-2">
+  <div class="section">
+    <h2>Top Cameras (7d)</h2>
+    ${
+      s.topCameras.length === 0
+        ? '<div class="empty">No data yet.</div>'
+        : `<table><thead><tr><th>Camera</th><th class="num">Notifs</th></tr></thead><tbody>${s.topCameras
+            .map(
+              (r) =>
+                `<tr><td>${escapeHTML(r.camera)}</td><td class="num">${Number(r.notifs).toLocaleString()}</td></tr>`
+            )
+            .join("")}</tbody></table>`
+    }
+  </div>
+  <div class="section">
+    <h2>Top Users (7d)</h2>
+    ${
+      s.topUsers.length === 0
+        ? '<div class="empty">No data yet.</div>'
+        : `<table><thead><tr><th>User</th><th>Country</th><th class="num">Notifs</th></tr></thead><tbody>${s.topUsers
+            .map(
+              (r) =>
+                `<tr><td class="token">${escapeHTML(r.user)}</td><td>${escapeHTML(r.country)}</td><td class="num">${Number(r.notifs).toLocaleString()}</td></tr>`
+            )
+            .join("")}</tbody></table>`
+    }
+  </div>
+</div>
+
+<footer>lumen-push · stats are pseudonymous (token prefix only) · data via Workers Analytics Engine</footer>
+
+<script>
+const DAILY = ${j(s.perDay)};
+const PLATFORMS = ${j(s.perPlatform)};
+
+window.addEventListener('load', () => {
+  if (typeof Chart === 'undefined') return;
+  const grid = '#20262f';
+  const tick = '#8a93a3';
+  Chart.defaults.color = tick;
+  Chart.defaults.borderColor = grid;
+  Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, system-ui, sans-serif';
+
+  if (DAILY.length > 0) {
+    new Chart(document.getElementById('dailyChart'), {
+      type: 'line',
+      data: {
+        labels: DAILY.map(d => d.day),
+        datasets: [
+          { label: 'Notifs', data: DAILY.map(d => Number(d.notifs)),
+            borderColor: '#5b8def', backgroundColor: 'rgba(91,141,239,0.15)',
+            fill: true, tension: 0.3, pointRadius: 2 },
+          { label: 'Users', data: DAILY.map(d => Number(d.users)),
+            borderColor: '#3ddc97', backgroundColor: 'rgba(61,220,151,0.10)',
+            fill: false, tension: 0.3, pointRadius: 2, yAxisID: 'y2' },
+        ]
+      },
+      options: {
+        maintainAspectRatio: false,
+        scales: {
+          y:  { beginAtZero: true, grid: { color: grid } },
+          y2: { beginAtZero: true, position: 'right', grid: { display: false } },
+          x:  { grid: { color: grid } },
+        },
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 10 } } }
+      }
+    });
+  }
+
+  if (PLATFORMS.length > 0) {
+    new Chart(document.getElementById('platformChart'), {
+      type: 'doughnut',
+      data: {
+        labels: PLATFORMS.map(p => p.platform),
+        datasets: [{
+          data: PLATFORMS.map(p => Number(p.notifs)),
+          backgroundColor: ['#5b8def','#3ddc97','#f5a623','#e25555','#a78bfa','#64748b'],
+          borderColor: '#0a0c10', borderWidth: 2,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 10 } } }
+      }
+    });
+  }
+});
+</script>
+</body>
+</html>`;
+}
+
+/**
+ * Daily Slack digest. Posts a summary of the past 24 hours to the configured
+ * incoming-webhook URL. Format is plain Slack blocks for readability.
+ */
+async function postSlackDigest(env: Env): Promise<void> {
+  const ds = "lumen_push_notif_stats";
+  const [totalsRows, perCountry] = await Promise.all([
+    runAnalyticsQuery<{ outcome: string; n: number; users: number }>(
+      env,
+      `SELECT blob5 AS outcome, SUM(_sample_interval) AS n, uniq(blob1) AS users
+       FROM ${ds} WHERE timestamp > NOW() - INTERVAL '24' HOUR GROUP BY outcome`
+    ),
+    runAnalyticsQuery<{ country: string; notifs: number }>(
+      env,
+      `SELECT blob2 AS country, SUM(_sample_interval) AS notifs
+       FROM ${ds} WHERE timestamp > NOW() - INTERVAL '24' HOUR AND blob5='sent'
+       GROUP BY country ORDER BY notifs DESC LIMIT 5`
+    ),
+  ]);
+
+  let sent = 0, rateLimited = 0, users = 0;
+  for (const r of totalsRows) {
+    if (r.outcome === "sent") { sent = Number(r.n) || 0; users = Number(r.users) || 0; }
+    else if (r.outcome === "rate_limited") { rateLimited = Number(r.n) || 0; }
+  }
+  const dropPct = sent + rateLimited > 0
+    ? ((rateLimited / (sent + rateLimited)) * 100).toFixed(1)
+    : "0.0";
+
+  const countryLines = perCountry.length > 0
+    ? perCountry.map(c => `• ${c.country}: ${Number(c.notifs).toLocaleString()}`).join("\n")
+    : "_no traffic_";
+
+  const text = `*Lumen Push — last 24h*
+:bell: ${sent.toLocaleString()} pushes sent · :busts_in_silhouette: ${users} users · :no_entry_sign: ${rateLimited} rate-limited (${dropPct}%)
+
+*Top countries*
+${countryLines}`;
+
+  await fetch(env.SLACK_WEBHOOK_URL!, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
 }
 

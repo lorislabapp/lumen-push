@@ -2,6 +2,17 @@ name = "lumen-push"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
+# Plain (non-secret) vars. The account ID is already in any wrangler URL
+# and is not a secret. STATS_TOKEN, CF_ANALYTICS_TOKEN and the optional
+# SLACK_WEBHOOK_URL go through `wrangler secret put` instead.
+[vars]
+CF_ACCOUNT_ID = "4c3e2b246dc1b838e47ed33cbbe3a39c"
+
+# Daily Slack digest at 08:00 UTC (09:00 Paris winter, 10:00 summer).
+# scheduled() handler no-ops if SLACK_WEBHOOK_URL secret is unset.
+[triggers]
+crons = ["0 8 * * *"]
+
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "103f9f605ffa41588382f0537b8c55ae"
