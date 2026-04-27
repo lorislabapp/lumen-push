@@ -20,6 +20,12 @@ export interface Env {
   // for a given secret, handleNotify falls back to the single token in the
   // URL (backward compatibility with pre-fan-out clients).
   DEVICES: KVNamespace;
+  // Workers Analytics Engine dataset for per-user / per-country notification
+  // stats. Optional so deploys without the binding still work (we no-op).
+  // Schema (see writeStat): blob1=tokenPrefix, blob2=country, blob3=camera,
+  // blob4=label, blob5=outcome ("sent"|"rate_limited"), blob6=platform.
+  // double1=count(=1), double2=top_score. index1=tokenPrefix.
+  NOTIF_STATS?: AnalyticsEngineDataset;
 }
 
 /**
@@ -99,7 +105,11 @@ export default {
       return handleUnregister(route, env);
     }
 
-    return handleNotify(request, route, env);
+    // CF-IPCountry is set by Cloudflare for the request's origin (Frigate
+    // server). It approximates where the user's NVR — and so the user — is
+    // located. Used for per-country notification stats.
+    const country = request.headers.get("CF-IPCountry") ?? "??";
+    return handleNotify(request, route, country, env);
   },
 };
 
@@ -232,6 +242,7 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
 async function handleNotify(
   request: Request,
   route: { secret: string; token: string; cam: string | null; sandbox: boolean },
+  country: string,
   env: Env
 ): Promise<Response> {
   let body: FrigateWebhook;
@@ -328,11 +339,56 @@ async function handleNotify(
     ? registered
     : [{ token: route.token, sandbox: route.sandbox, registered_at: 0 }];
 
+  const meta: NotifyMeta = {
+    camera: event.camera,
+    label: event.label,
+    topScore: event.top_score,
+    country,
+  };
+
   await Promise.all(
-    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, env))
+    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env))
   );
 
   return new Response("OK", { status: 200 });
+}
+
+interface NotifyMeta {
+  camera: string;
+  label: string;
+  topScore: number;
+  country: string;
+}
+
+/**
+ * Records one data point in Workers Analytics Engine. No-op if the binding is
+ * missing (e.g. on first deploy after adding the binding to wrangler.toml).
+ *
+ * Privacy: the device token is truncated to its first 8 hex chars before
+ * being stored. That's a stable per-device pseudonym (sufficient to count
+ * unique users) but not the actual APNs token — we never expose the full
+ * token in stats logs. CF-IPCountry is a 2-letter country code (or "??").
+ */
+function writeStat(
+  env: Env,
+  device: RegisteredDevice,
+  meta: NotifyMeta,
+  outcome: "sent" | "rate_limited"
+): void {
+  if (!env.NOTIF_STATS) return;
+  const userKey = device.token.slice(0, 8);
+  env.NOTIF_STATS.writeDataPoint({
+    blobs: [
+      userKey,
+      meta.country,
+      meta.camera,
+      meta.label,
+      outcome,
+      device.platform ?? "unknown",
+    ],
+    doubles: [1, meta.topScore],
+    indexes: [userKey],
+  });
 }
 
 /**
@@ -344,6 +400,7 @@ async function handleNotify(
 async function sendToDeviceRateLimited(
   device: RegisteredDevice,
   payload: unknown,
+  meta: NotifyMeta,
   env: Env
 ): Promise<void> {
   // Per-device rate limit: 5s minimum gap between pushes to the same
@@ -362,11 +419,13 @@ async function sendToDeviceRateLimited(
   if (lastPush) {
     const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
     if (elapsed < minIntervalSeconds) {
+      writeStat(env, device, meta, "rate_limited");
       return;
     }
   }
   await rateLimitPut("rl", device.token, String(Date.now()), 60);
   await sendAPNs(device.token, payload, device.sandbox, env);
+  writeStat(env, device, meta, "sent");
 }
 
 // --- APNs JWT signing and delivery ---

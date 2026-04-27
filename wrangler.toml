@@ -9,3 +9,10 @@ id = "103f9f605ffa41588382f0537b8c55ae"
 [[kv_namespaces]]
 binding = "DEVICES"
 id = "505b10887ac844338b94b7340906865e"
+
+# Per-user / per-country notification stats. Workers Analytics Engine is
+# included in the Workers Paid plan: 25M writes/mo + 1M reads/mo. At our
+# scale (~18k notifs/mo) we're 1000x under the quota.
+[[analytics_engine_datasets]]
+binding = "NOTIF_STATS"
+dataset = "lumen_push_notif_stats"
