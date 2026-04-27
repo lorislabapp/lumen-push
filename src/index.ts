@@ -166,13 +166,47 @@ async function handleUnregister(
   );
 }
 
+/**
+ * Per-token rate-limit state, stored in the Workers Cache API instead of KV.
+ *
+ * Why: KV writes are capped at 1 000/day on the Workers Free plan and every
+ * notification fan-out wrote one key, which pushed us close to the cap. The
+ * Cache API has no such per-op quota.
+ *
+ * Trade-off: caches.default is per-data-center, not globally consistent. For
+ * per-token rate limiting where requests for one device usually hit the same
+ * colo (Frigate origin → APNs), this is effectively equivalent to KV with a
+ * negligible chance of a duplicate notification slipping through.
+ */
+const RATE_LIMIT_BASE = "https://lumen-push.internal/rate";
+
+function rateLimitURL(prefix: string, token: string): string {
+  return `${RATE_LIMIT_BASE}/${prefix}/${encodeURIComponent(token)}`;
+}
+
+async function rateLimitGet(prefix: string, token: string): Promise<string | null> {
+  const hit = await caches.default.match(rateLimitURL(prefix, token));
+  return hit ? await hit.text() : null;
+}
+
+async function rateLimitPut(
+  prefix: string,
+  token: string,
+  value: string,
+  ttlSeconds: number
+): Promise<void> {
+  const res = new Response(value, {
+    headers: { "Cache-Control": `max-age=${ttlSeconds}` },
+  });
+  await caches.default.put(rateLimitURL(prefix, token), res);
+}
+
 async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Response> {
-  const testKey = `test:${token}`;
-  const lastTest = await env.RATE_LIMIT.get(testKey);
+  const lastTest = await rateLimitGet("test", token);
   if (lastTest) {
     return new Response("OK", { status: 200 });
   }
-  await env.RATE_LIMIT.put(testKey, String(Date.now()), { expirationTtl: 60 });
+  await rateLimitPut("test", token, String(Date.now()), 60);
 
   const payload = {
     aps: {
@@ -265,6 +299,11 @@ async function handleNotify(
     camera: event.camera,
     label: event.label,
     zones: event.zones || [],
+    // Forwarded so the NSE rules engine can evaluate scoreAtLeast and
+    // subLabelEquals leaves on closed-app pushes (rules engine is otherwise
+    // limited to camera/label/zones/time when running in the extension).
+    top_score: event.top_score,
+    sub_label: event.sub_label,
     // Unix epoch seconds of Frigate detection. The NSE uses this to show the
     // user "detected Xs ago" so real-time pushes can be visually distinguished
     // from pushes APNs held while the device was unreachable.
@@ -302,15 +341,14 @@ async function sendToDeviceRateLimited(
   payload: unknown,
   env: Env
 ): Promise<void> {
-  const rateKey = `rl:${device.token}`;
-  const lastPush = await env.RATE_LIMIT.get(rateKey);
+  const lastPush = await rateLimitGet("rl", device.token);
   if (lastPush) {
     const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
     if (elapsed < 30) {
       return;
     }
   }
-  await env.RATE_LIMIT.put(rateKey, String(Date.now()), { expirationTtl: 120 });
+  await rateLimitPut("rl", device.token, String(Date.now()), 120);
   await sendAPNs(device.token, payload, device.sandbox, env);
 }
 
