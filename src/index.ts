@@ -8,6 +8,11 @@ export interface Env {
   // events are dropped as stale (MQTT replay, relay backlog, etc.). Set to "0"
   // to disable. Defaults to 120 if unset.
   MAX_EVENT_AGE_SECONDS?: string;
+  // Minimum gap (seconds) between consecutive pushes to the same APNs token.
+  // Prevents runaway notification loops without dropping legitimate
+  // consecutive detections. Defaults to 5 if unset (was 30 historically;
+  // 30 was too aggressive for security cameras — see commit message).
+  RATE_LIMIT_SECONDS?: string;
   RATE_LIMIT: KVNamespace;
   // Phase 1 multi-device fan-out: maps `secret` -> list of registered devices.
   // Populated via POST /v1/register. Consumed by handleNotify to fan out
@@ -341,14 +346,26 @@ async function sendToDeviceRateLimited(
   payload: unknown,
   env: Env
 ): Promise<void> {
+  // Per-device rate limit: 5s minimum gap between pushes to the same
+  // APNs token. Was 30s — too aggressive for security cameras where
+  // a single intrusion can fire 5+ legitimate events in <30s. Users
+  // were perceiving 30s+ latency because the FIRST event hit, the
+  // rate-limit blocked the next 5 detections, and they only saw the
+  // 6th detection ~30s later than their visible event.
+  //
+  // 5s still suppresses runaway loops (one camera firing every second
+  // for hours) without dropping legitimate consecutive detections.
+  // Override via env.RATE_LIMIT_SECONDS for deployments that want a
+  // different cadence.
+  const minIntervalSeconds = parseInt(env.RATE_LIMIT_SECONDS ?? "5", 10);
   const lastPush = await rateLimitGet("rl", device.token);
   if (lastPush) {
     const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
-    if (elapsed < 30) {
+    if (elapsed < minIntervalSeconds) {
       return;
     }
   }
-  await rateLimitPut("rl", device.token, String(Date.now()), 120);
+  await rateLimitPut("rl", device.token, String(Date.now()), 60);
   await sendAPNs(device.token, payload, device.sandbox, env);
 }
 
