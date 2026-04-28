@@ -632,11 +632,15 @@ async function loadStats(env: Env): Promise<StatsBundle> {
 
   const [totalsRows, perCountry, perDay, perPlatform, topCameras, topUsers] =
     await Promise.all([
+      // Cloudflare Analytics Engine SQL only supports a small subset of
+      // ClickHouse — `uniq()` and `any()` are NOT in it. Use
+      // `count(DISTINCT ...)` for unique counts and `min(...)` (which IS
+      // supported) for the "pick one representative value per group" trick.
       runAnalyticsQuery<{ outcome: string; n: number; users: number }>(
         env,
         `SELECT blob5 AS outcome,
                 SUM(_sample_interval) AS n,
-                uniq(blob1) AS users
+                count(DISTINCT blob1) AS users
          FROM ${ds}
          WHERE timestamp > NOW() - INTERVAL '7' DAY
          GROUP BY outcome`
@@ -650,9 +654,9 @@ async function loadStats(env: Env): Promise<StatsBundle> {
       ),
       runAnalyticsQuery<{ day: string; notifs: number; users: number }>(
         env,
-        `SELECT formatDateTime(timestamp, '%F') AS day,
+        `SELECT toStartOfDay(timestamp) AS day,
                 SUM(_sample_interval) AS notifs,
-                uniq(blob1) AS users
+                count(DISTINCT blob1) AS users
          FROM ${ds}
          WHERE timestamp > NOW() - INTERVAL '30' DAY AND blob5 = 'sent'
          GROUP BY day ORDER BY day`
@@ -671,9 +675,13 @@ async function loadStats(env: Env): Promise<StatsBundle> {
          WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob5 = 'sent'
          GROUP BY camera ORDER BY notifs DESC LIMIT 10`
       ),
+      // CF Analytics Engine min/max don't accept String args (they only
+      // work on numbers), so we can't pick a representative country per
+      // user the cheap way. Drop the country column — the per-country
+      // table above is the source of truth for geographic distribution.
       runAnalyticsQuery<{ user: string; country: string; notifs: number }>(
         env,
-        `SELECT blob1 AS user, any(blob2) AS country, SUM(_sample_interval) AS notifs
+        `SELECT blob1 AS user, '' AS country, SUM(_sample_interval) AS notifs
          FROM ${ds}
          WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob5 = 'sent'
          GROUP BY user ORDER BY notifs DESC LIMIT 20`
@@ -920,7 +928,7 @@ async function postSlackDigest(env: Env): Promise<void> {
   const [totalsRows, perCountry] = await Promise.all([
     runAnalyticsQuery<{ outcome: string; n: number; users: number }>(
       env,
-      `SELECT blob5 AS outcome, SUM(_sample_interval) AS n, uniq(blob1) AS users
+      `SELECT blob5 AS outcome, SUM(_sample_interval) AS n, count(DISTINCT blob1) AS users
        FROM ${ds} WHERE timestamp > NOW() - INTERVAL '24' HOUR GROUP BY outcome`
     ),
     runAnalyticsQuery<{ country: string; notifs: number }>(
