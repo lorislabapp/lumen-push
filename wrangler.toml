@@ -1,6 +1,7 @@
 name = "lumen-push"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
+account_id = "4c3e2b246dc1b838e47ed33cbbe3a39c"
 
 # Plain (non-secret) vars. The account ID is already in any wrangler URL
 # and is not a secret. STATS_TOKEN, CF_ANALYTICS_TOKEN and the optional
