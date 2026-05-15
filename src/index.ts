@@ -300,6 +300,38 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
   return new Response("OK", { status: 200 });
 }
 
+/**
+ * Determine if a detection should be delivered as a critical alert.
+ *
+ * Critical alerts bypass Do Not Disturb and require the critical-alerts
+ * entitlement (granted 2026-04-28). Use sparingly — only for events that
+ * genuinely require immediate attention regardless of device state.
+ *
+ * Current heuristic:
+ * - Person detection with confidence >= 85%
+ * - Package detection with confidence >= 80%
+ *
+ * The NSE rules engine may override this on the device side based on
+ * per-camera/zone rules configured by the user.
+ */
+function shouldBeCritical(event: FrigateEvent): boolean {
+  const label = event.label?.toLowerCase() ?? "";
+  const score = event.top_score ?? 0;
+
+  // Person detection with high confidence
+  if (label === "person" && score >= 0.85) {
+    return true;
+  }
+
+  // Package detection (theft prevention)
+  if (label === "package" && score >= 0.80) {
+    return true;
+  }
+
+  // Default: time-sensitive but not critical
+  return false;
+}
+
 async function handleNotify(
   request: Request,
   route: { secret: string; token: string; cam: string | null; sandbox: boolean },
@@ -359,6 +391,13 @@ async function handleNotify(
   }
   bodyParts.push(`Confidence: ${Math.round(event.top_score * 100)}%`);
 
+  // Determine priority and interruption level based on detection characteristics.
+  // Critical alerts bypass Do Not Disturb and require the entitlement (granted 2026-04-28).
+  const isCritical = shouldBeCritical(event);
+  const interruptionLevel = isCritical ? "critical" : "time-sensitive";
+  const sound = isCritical ? "critical" : "default";
+  const priority = isCritical ? 10 : 10;  // Both use highest priority for now
+
   const apnsPayload: Record<string, unknown> = {
     aps: {
       alert: {
@@ -366,8 +405,8 @@ async function handleNotify(
         subtitle: cameraName,
         body: bodyParts.join(" | "),
       },
-      sound: "default",
-      "interruption-level": "time-sensitive",
+      sound,
+      "interruption-level": interruptionLevel,
       category: "FRIGATE_EVENT",
       "thread-id": event.camera,
       "mutable-content": 1,
@@ -431,7 +470,7 @@ async function handleNotify(
   };
 
   await Promise.all(
-    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env))
+    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority))
   );
 
   return new Response("OK", { status: 200 });
@@ -485,7 +524,8 @@ async function sendToDeviceRateLimited(
   device: RegisteredDevice,
   payload: unknown,
   meta: NotifyMeta,
-  env: Env
+  env: Env,
+  priority: number = 10
 ): Promise<void> {
   // Per-device rate limit: 5s minimum gap between pushes to the same
   // APNs token. Was 30s — too aggressive for security cameras where
@@ -508,7 +548,7 @@ async function sendToDeviceRateLimited(
     }
   }
   await rateLimitPut("rl", device.token, String(Date.now()), 60);
-  await sendAPNs(device.token, payload, device.sandbox, env);
+  await sendAPNs(device.token, payload, device.sandbox, env, priority);
   writeStat(env, device, meta, "sent");
 }
 
@@ -593,7 +633,13 @@ function derToRaw(der: Uint8Array): Uint8Array {
   return raw;
 }
 
-async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: Env): Promise<void> {
+async function sendAPNs(
+  token: string,
+  payload: unknown,
+  sandbox: boolean,
+  env: Env,
+  priority: number = 10
+): Promise<void> {
   try {
     const jwt = await getAPNsJWT(env);
     const apnsHost = sandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
@@ -610,7 +656,7 @@ async function sendAPNs(token: string, payload: unknown, sandbox: boolean, env: 
           authorization: `bearer ${jwt}`,
           "apns-push-type": "alert",
           "apns-topic": env.APNS_BUNDLE_ID,
-          "apns-priority": "10",
+          "apns-priority": String(priority),
           "apns-expiration": String(expiresAt),
           "content-type": "application/json",
         },
