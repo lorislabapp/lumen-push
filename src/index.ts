@@ -65,6 +65,7 @@ interface FrigateEvent {
   end_time: number | null;
   stationary: boolean;
   sub_label: string | null;
+  compressed_snapshot?: string;  // Base64-encoded JPEG from relay pre-compression
 }
 
 interface FrigateWebhook {
@@ -100,6 +101,28 @@ export default {
       return handleStats(request, env);
     }
 
+    // Compressed snapshot retrieval (GET, public). Used by NSE when the
+    // compressed snapshot was too large to embed in the APNs payload.
+    // Shape: /snapshot/<event-id>
+    if (request.method === "GET" && url.pathname.startsWith("/snapshot/")) {
+      const eventId = url.pathname.slice("/snapshot/".length);
+      if (!eventId || eventId.length < 8) {
+        return new Response("Bad request", { status: 400 });
+      }
+      const snapshotKey = `snapshot:${eventId}`;
+      const compressed = await env.RATE_LIMIT.get(snapshotKey);
+      if (!compressed) {
+        return new Response("Not found", { status: 404 });
+      }
+      // Return the base64-encoded JPEG. The NSE will decode it.
+      return new Response(compressed, {
+        headers: {
+          "Content-Type": "text/plain",
+          "Cache-Control": "public, max-age=3600",
+        },
+      });
+    }
+
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
     }
@@ -110,7 +133,10 @@ export default {
     }
 
     const contentLength = request.headers.get("content-length");
-    if (contentLength && parseInt(contentLength) > 4096) {
+    // Increased from 4KB to 128KB to accommodate relay-compressed snapshots
+    // (~40KB base64 + metadata). The Worker will decide whether to embed
+    // in the APNs payload or store in KV.
+    if (contentLength && parseInt(contentLength) > 131072) {
       return new Response("Payload too large", { status: 413 });
     }
 
@@ -333,7 +359,7 @@ async function handleNotify(
   }
   bodyParts.push(`Confidence: ${Math.round(event.top_score * 100)}%`);
 
-  const apnsPayload = {
+  const apnsPayload: Record<string, unknown> = {
     aps: {
       alert: {
         title: `${label} Detected`,
@@ -361,6 +387,29 @@ async function handleNotify(
     detected_at: event.start_time,
     source: "cloudflare-relay",
   };
+
+  // Pre-compressed snapshot from relay: either embed directly (if under 4KB
+  // total) or store in KV and include URL. This reduces NSE download latency
+  // from ~500ms (full-size from Frigate) to 0ms (embedded) or ~50ms (CDN).
+  if (event.compressed_snapshot) {
+    // Try embedding first
+    const withSnapshot = { ...apnsPayload, compressed_snapshot: event.compressed_snapshot };
+    const payloadSize = new TextEncoder().encode(JSON.stringify(withSnapshot)).length;
+
+    if (payloadSize < 4096) {
+      // Fits in APNs payload — embed directly (zero NSE download latency)
+      apnsPayload.compressed_snapshot = event.compressed_snapshot;
+      console.log(`Embedded snapshot for ${event.camera}/${event.id}: ${payloadSize} bytes`);
+    } else {
+      // Too large — store in KV with 1h TTL, include URL
+      const snapshotKey = `snapshot:${event.id}`;
+      await env.RATE_LIMIT.put(snapshotKey, event.compressed_snapshot, { expirationTtl: 3600 });
+      // NSE will fetch from https://<worker-host>/snapshot/<event-id>
+      // (we'd need to add a GET handler for this, but for now just pass the key)
+      apnsPayload.compressed_snapshot_key = snapshotKey;
+      console.log(`Stored snapshot in KV for ${event.camera}/${event.id}: ${payloadSize} bytes → KV`);
+    }
+  }
 
   // Phase 1 fan-out: look up all devices registered under this secret. If the
   // user has registered via POST /v1/register (iPhone + iPad + Mac + Watch...),
