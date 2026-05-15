@@ -440,13 +440,14 @@ async function handleNotify(
       apnsPayload.compressed_snapshot = event.compressed_snapshot;
       console.log(`Embedded snapshot for ${event.camera}/${event.id}: ${payloadSize} bytes`);
     } else {
-      // Too large — store in KV with 1h TTL, include URL
+      // Too large — store in KV with 1h TTL, include full URL for NSE
       const snapshotKey = `snapshot:${event.id}`;
       await env.RATE_LIMIT.put(snapshotKey, event.compressed_snapshot, { expirationTtl: 3600 });
-      // NSE will fetch from https://<worker-host>/snapshot/<event-id>
-      // (we'd need to add a GET handler for this, but for now just pass the key)
-      apnsPayload.compressed_snapshot_key = snapshotKey;
-      console.log(`Stored snapshot in KV for ${event.camera}/${event.id}: ${payloadSize} bytes → KV`);
+      // Construct full URL for NSE: https://<worker-host>/snapshot/<event-id>
+      const workerOrigin = new URL(request.url).origin;
+      const snapshotURL = `${workerOrigin}/snapshot/${event.id}`;
+      apnsPayload.compressed_snapshot_url = snapshotURL;
+      console.log(`Stored snapshot in KV for ${event.camera}/${event.id}: ${payloadSize} bytes → ${snapshotURL}`);
     }
   }
 
