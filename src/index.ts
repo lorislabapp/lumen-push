@@ -1,3 +1,5 @@
+import { classifyEvent } from "./classifier";
+
 export interface Env {
   APNS_KEY: string;
   APNS_KEY_ID: string;
@@ -381,6 +383,17 @@ async function handleNotify(
     }
   }
 
+  // AI Classification (Phase 1: rule-based)
+  // NSE will use this to render bilingual templates instead of the default alert below.
+  const classification = classifyEvent({
+    label: event.label,
+    camera: event.camera,
+    zones: event.zones || [],
+    top_score: event.top_score,
+    start_time: event.start_time,
+    stationary: event.stationary,
+  });
+
   // Build APNs payload
   const cameraName = event.camera.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   const label = event.label.replace(/\b\w/g, (c) => c.toUpperCase());
@@ -425,6 +438,9 @@ async function handleNotify(
     // from pushes APNs held while the device was unreachable.
     detected_at: event.start_time,
     source: "cloudflare-relay",
+    // AI classification (Phase 1: rule-based, Phase 2: Worker AI)
+    // NSE applyAIClassification() uses this to render bilingual templates
+    classification,
   };
 
   // Pre-compressed snapshot from relay: either embed directly (if under 4KB
