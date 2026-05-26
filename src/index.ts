@@ -68,6 +68,10 @@ interface FrigateEvent {
   stationary: boolean;
   sub_label: string | null;
   compressed_snapshot?: string;  // Base64-encoded JPEG from relay pre-compression
+  // Set by the relay when the event matches the user's configured critical
+  // rule (critical cameras + schedule). Drives the critical interruption level
+  // instead of a hardcoded Worker heuristic. Absent/false => time-sensitive.
+  lumen_critical?: boolean;
 }
 
 interface FrigateWebhook {
@@ -306,32 +310,17 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
  * Determine if a detection should be delivered as a critical alert.
  *
  * Critical alerts bypass Do Not Disturb and require the critical-alerts
- * entitlement (granted 2026-04-28). Use sparingly — only for events that
- * genuinely require immediate attention regardless of device state.
+ * entitlement (granted 2026-04-28).
  *
- * Current heuristic:
- * - Person detection with confidence >= 85%
- * - Package detection with confidence >= 80%
- *
- * The NSE rules engine may override this on the device side based on
- * per-camera/zone rules configured by the user.
+ * Criticality is now driven by the USER's configuration, not a hardcoded
+ * heuristic. The relay (which holds the per-user config — critical cameras,
+ * zones, schedules) sets `lumen_critical: true` on events that match the
+ * user's critical rule. The previous "person >= 85% => critical" heuristic
+ * made benign detections (e.g. a mail delivery) bypass Do Not Disturb, which
+ * is wrong — only the user's own rules should decide. Default: never critical.
  */
 function shouldBeCritical(event: FrigateEvent): boolean {
-  const label = event.label?.toLowerCase() ?? "";
-  const score = event.top_score ?? 0;
-
-  // Person detection with high confidence
-  if (label === "person" && score >= 0.85) {
-    return true;
-  }
-
-  // Package detection (theft prevention)
-  if (label === "package" && score >= 0.80) {
-    return true;
-  }
-
-  // Default: time-sensitive but not critical
-  return false;
+  return event.lumen_critical === true;
 }
 
 async function handleNotify(
