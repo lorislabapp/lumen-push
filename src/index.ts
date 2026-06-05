@@ -475,8 +475,16 @@ async function handleNotify(
     country,
   };
 
+  // apns-collapse-id: coalesce notifications for the SAME Frigate event so the
+  // user never sees one detection twice (Michel L 2026-06: "notifications
+  // coming in duplicate"). Matches the app's local-notification identifier
+  // ("lumen-<eventId>"), so iOS also replaces a WebSocket-path local notif
+  // with this remote push instead of stacking them. Loss-free: only merges
+  // identical-event notifications, never drops a distinct alert. 64-byte APNs cap.
+  const collapseId = `lumen-${event.id}`.slice(0, 64);
+
   await Promise.all(
-    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority))
+    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority, collapseId))
   );
 
   return new Response("OK", { status: 200 });
@@ -531,7 +539,8 @@ async function sendToDeviceRateLimited(
   payload: unknown,
   meta: NotifyMeta,
   env: Env,
-  priority: number = 10
+  priority: number = 10,
+  collapseId?: string
 ): Promise<void> {
   // Per-device rate limit: 5s minimum gap between pushes to the same
   // APNs token. Was 30s — too aggressive for security cameras where
@@ -554,7 +563,7 @@ async function sendToDeviceRateLimited(
     }
   }
   await rateLimitPut("rl", device.token, String(Date.now()), 60);
-  await sendAPNs(device.token, payload, device.sandbox, env, priority);
+  await sendAPNs(device.token, payload, device.sandbox, env, priority, collapseId);
   writeStat(env, device, meta, "sent");
 }
 
@@ -644,7 +653,8 @@ async function sendAPNs(
   payload: unknown,
   sandbox: boolean,
   env: Env,
-  priority: number = 10
+  priority: number = 10,
+  collapseId?: string
 ): Promise<void> {
   try {
     const jwt = await getAPNsJWT(env);
@@ -654,18 +664,26 @@ async function sendAPNs(
     // (device offline, asleep, low-power). `0` would drop immediately.
     const expiresAt = Math.floor(Date.now() / 1000) + 3600;
 
+    const headers: Record<string, string> = {
+      authorization: `bearer ${jwt}`,
+      "apns-push-type": "alert",
+      "apns-topic": env.APNS_BUNDLE_ID,
+      "apns-priority": String(priority),
+      "apns-expiration": String(expiresAt),
+      "content-type": "application/json",
+    };
+    // Dedupe: pushes for the same Frigate event replace each other (and the
+    // app's matching local notification) instead of stacking. See the notify
+    // handler where collapseId is derived.
+    if (collapseId) {
+      headers["apns-collapse-id"] = collapseId;
+    }
+
     const response = await fetch(
       `https://${apnsHost}/3/device/${token}`,
       {
         method: "POST",
-        headers: {
-          authorization: `bearer ${jwt}`,
-          "apns-push-type": "alert",
-          "apns-topic": env.APNS_BUNDLE_ID,
-          "apns-priority": String(priority),
-          "apns-expiration": String(expiresAt),
-          "content-type": "application/json",
-        },
+        headers,
         body: JSON.stringify(payload),
       }
     );
