@@ -9,7 +9,7 @@ Open-source Cloudflare Worker that relays [Frigate NVR](https://github.com/blake
 ```
 Frigate NVR
       |
-      |  MQTT event: frigate/events  (Frigate does not send HTTP webhooks natively)
+      |  MQTT review: frigate/reviews  (Frigate does not send HTTP webhooks natively)
       v
 lumen-push-relay (this is a small container you run on your network)
       |  https://github.com/lorislabapp/lumen-push-relay
@@ -18,8 +18,8 @@ lumen-push-relay (this is a small container you run on your network)
       |  3. POSTs a compact JSON payload to the Cloudflare Worker
       v
 Cloudflare Worker (this repo)
-      |  1. Validates event schema
-      |  2. Server-side filters (stationary, top_score < 0.5)
+      |  1. Requires Frigate Review alerts (legacy raw events fail closed)
+      |  2. Server-side filters (Review contract, stationary, optional score)
       |  3. Rate limits: 30s per device token (Cloudflare KV)
       |  4. Signs APNs JWT (ES256, cached 50min)
       |  5. Delivers to Apple APNs with 1h expiration retry
@@ -32,6 +32,11 @@ Lumen app on iOS / iPadOS / macOS / watchOS / tvOS / visionOS
       v
 User sees notification (typically <1s end-to-end)
 ```
+
+Legacy raw `frigate/events` payloads are rejected by default because tracked
+objects do not necessarily become user-visible Frigate Review alerts. During a
+controlled migration only, the Worker can temporarily accept them with
+`ALLOW_RAW_EVENTS=true`; the relay has a matching explicit opt-in.
 
 ## How it works
 
@@ -55,40 +60,40 @@ User sees notification (typically <1s end-to-end)
 
 ### `POST /v1/notify/<secret>/<device_token>`
 
-The push endpoint. `lumen-push-relay` POSTs here for each Frigate event that passes its filters. The URL is unique per Lumen device and is generated inside the app (Settings → Push Notifications → Copy URL).
+The push endpoint. `lumen-push-relay` POSTs here for each Frigate Review alert that passes its filters. The URL is unique per Lumen device and is generated inside the app (Settings → Push Notifications → Copy URL).
 
-You can also POST to this endpoint directly from any tool (ntfy, n8n, a custom script, `curl`, etc.) — the Worker only cares about the JSON schema below.
+Direct callers must use the same Review-derived schema below.
 
 **Query parameters:**
 - `?cam=<camera_name>` — Only forward events from this camera (free tier restriction)
 - `?sandbox=1` — Use APNs sandbox (development builds only)
 
-**Request body:** Standard Frigate webhook JSON:
+**Request body:** Review-derived relay JSON:
 ```json
 {
   "type": "new",
   "before": null,
   "after": {
     "id": "1710756000.123-abc",
+    "review_id": "1710756000.000-review",
+    "review_severity": "alert",
+    "source_schema": "frigate-review-v1",
     "camera": "front_door",
     "label": "person",
-    "top_score": 0.87,
     "zones": ["porch"],
-    "has_snapshot": true,
-    "has_clip": true,
     "start_time": 1710756000.123,
-    "end_time": null,
-    "stationary": false,
-    "sub_label": null
+    "detected_at": 1710756000.123
   }
 }
 ```
 
 **Filtering (server-side):**
-- Only `type: "new"` events are forwarded
+- Only `type: "new"` Review-derived payloads are forwarded
+- Review identity and severity (`alert` or explicitly enabled `detection`) are required
+- Raw `frigate/events` payloads fail closed unless `ALLOW_RAW_EVENTS=true`
 - Stationary objects are skipped
-- Events with `top_score < 0.5` are skipped
-- Rate limited to 1 push per 30 seconds per device token
+- When a score is present, events with `top_score < 0.5` are skipped
+- Rate limited to 1 push per 5 seconds per device token by default
 
 **APNs payload sent:**
 ```json

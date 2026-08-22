@@ -15,6 +15,10 @@ export interface Env {
   // consecutive detections. Defaults to 5 if unset (was 30 historically;
   // 30 was too aggressive for security cameras — see commit message).
   RATE_LIMIT_SECONDS?: string;
+  // Emergency compatibility switch for legacy relays that still publish raw
+  // frigate/events objects. Off by default because those objects are not the
+  // user-visible Review alerts shown by Frigate and caused false notifications.
+  ALLOW_RAW_EVENTS?: string;
   RATE_LIMIT: KVNamespace;
   // Phase 1 multi-device fan-out: maps `secret` -> list of registered devices.
   // Populated via POST /v1/register. Consumed by handleNotify to fan out
@@ -59,14 +63,18 @@ interface FrigateEvent {
   id: string;
   camera: string;
   label: string;
-  top_score: number;
+  top_score?: number;
   zones: string[];
-  has_snapshot: boolean;
-  has_clip: boolean;
+  has_snapshot?: boolean;
+  has_clip?: boolean;
   start_time: number;
-  end_time: number | null;
-  stationary: boolean;
-  sub_label: string | null;
+  detected_at?: number;
+  end_time?: number | null;
+  stationary?: boolean;
+  sub_label?: string | null;
+  review_id?: string;
+  review_severity?: string;
+  source_schema?: string;
   compressed_snapshot?: string;  // Base64-encoded JPEG from relay pre-compression
   // Set by the relay when the event matches the user's configured critical
   // rule (critical cameras + schedule). Drives the critical interruption level
@@ -341,7 +349,19 @@ async function handleNotify(
   }
 
   const event = body.after;
-  if (!event?.id || !event?.camera || !event?.label || event?.top_score === undefined) {
+  if (!event?.id || !event?.camera || !event?.label) {
+    return new Response("Bad request", { status: 400 });
+  }
+
+  const isReviewEvent = event.source_schema === "frigate-review-v1";
+  const validReviewSeverities = new Set(["alert", "detection"]);
+  if (isReviewEvent && (!event.review_id || !event.review_severity || !validReviewSeverities.has(event.review_severity))) {
+    return new Response("Bad request", { status: 400 });
+  }
+  if (!isReviewEvent && env.ALLOW_RAW_EVENTS !== "true") {
+    return new Response("Raw Frigate events are disabled", { status: 400 });
+  }
+  if (!isReviewEvent && event.top_score === undefined) {
     return new Response("Bad request", { status: 400 });
   }
 
@@ -353,7 +373,7 @@ async function handleNotify(
     return new Response("OK", { status: 200 });
   }
 
-  if (event.top_score < 0.5) {
+  if (event.top_score !== undefined && event.top_score < 0.5) {
     return new Response("OK", { status: 200 });
   }
 
@@ -374,7 +394,7 @@ async function handleNotify(
 
   // AI Classification (Phase 1: rule-based)
   // NSE will use this to render bilingual templates instead of the default alert below.
-  const classification = classifyEvent({
+  const classification = event.top_score === undefined ? undefined : classifyEvent({
     label: event.label,
     camera: event.camera,
     zones: event.zones || [],
@@ -391,7 +411,12 @@ async function handleNotify(
   if (event.zones?.length) {
     bodyParts.push(`Zone: ${event.zones.join(", ")}`);
   }
-  bodyParts.push(`Confidence: ${Math.round(event.top_score * 100)}%`);
+  if (event.top_score !== undefined) {
+    bodyParts.push(`Confidence: ${Math.round(event.top_score * 100)}%`);
+  }
+  if (bodyParts.length === 0) {
+    bodyParts.push(cameraName);
+  }
 
   // Determine priority and interruption level based on detection characteristics.
   // Critical alerts bypass Do Not Disturb and require the entitlement (granted 2026-04-28).
@@ -414,6 +439,9 @@ async function handleNotify(
       "mutable-content": 1,
     },
     eventId: event.id,
+    reviewId: event.review_id,
+    reviewSeverity: event.review_severity,
+    sourceSchema: event.source_schema ?? "legacy-event-v1",
     camera: event.camera,
     label: event.label,
     zones: event.zones || [],
@@ -425,11 +453,11 @@ async function handleNotify(
     // Unix epoch seconds of Frigate detection. The NSE uses this to show the
     // user "detected Xs ago" so real-time pushes can be visually distinguished
     // from pushes APNs held while the device was unreachable.
-    detected_at: event.start_time,
+    detected_at: event.detected_at ?? event.start_time,
     source: "cloudflare-relay",
     // AI classification (Phase 1: rule-based, Phase 2: Worker AI)
     // NSE applyAIClassification() uses this to render bilingual templates
-    classification,
+    ...(classification ? { classification } : {}),
   };
 
   // Pre-compressed snapshot from relay: either embed directly (if under 4KB
@@ -471,7 +499,7 @@ async function handleNotify(
   const meta: NotifyMeta = {
     camera: event.camera,
     label: event.label,
-    topScore: event.top_score,
+    topScore: event.top_score ?? 0,
     country,
   };
 
@@ -1083,4 +1111,3 @@ ${countryLines}`;
     body: JSON.stringify({ text }),
   });
 }
-
