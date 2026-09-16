@@ -99,6 +99,8 @@ export interface ReviewEnvelope {
    * banner is rewritten instead of alerting again.
    */
   isEnrichment?: boolean;
+  /** Set only by normalizeNotifyBody for a published relay's lumen_critical flag. */
+  legacyCritical?: boolean;
   custom_title?: string;
   custom_body?: string;
   automationSchema?: string;
@@ -192,7 +194,69 @@ export function validateReviewEnvelope(value: unknown): ReviewEnvelope | null {
   if (body.description !== undefined && body.description !== null
       && (typeof body.description !== "string" || body.description.length === 0 || body.description.length > 500)) return null;
   if (body.isEnrichment !== undefined && typeof body.isEnrichment !== "boolean") return null;
+  if (body.legacyCritical !== undefined) return null;
   return body as unknown as ReviewEnvelope;
+}
+
+function optionalString(value: unknown, max: number): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= max ? value : undefined;
+}
+
+/**
+ * Relays already running in the field post snake_case Frigate events
+ * (`top_score`, `start_time`, optional `review_id` / `source_schema`), not the
+ * camelCase Review envelope. Map them onto the envelope so one Worker serves
+ * both; returns "drop" for low-confidence events the v1 Worker also ignored.
+ */
+export function normalizeNotifyBody(value: unknown): ReviewEnvelope | "drop" | null {
+  const envelope = validateReviewEnvelope(value);
+  if (envelope) return envelope;
+  if (!value || typeof value !== "object") return null;
+  const body = value as Record<string, unknown>;
+  if ("sourceSchema" in body || "legacyCritical" in body) return null;
+  const id = optionalString(body.id, 256);
+  const camera = optionalString(body.camera, 256);
+  const label = optionalString(body.label, 256);
+  if (!id || !camera || !label) return null;
+  const score = body.top_score;
+  if (score !== undefined && (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 1)) return null;
+  const isReview = body.source_schema === "frigate-review-v1";
+  if (score === undefined && !isReview) return null;
+  if (typeof score === "number" && score < 0.5) return "drop";
+  const detectedAt = typeof body.detected_at === "number" ? body.detected_at : body.start_time;
+  const rawSubLabel = Array.isArray(body.sub_label) ? body.sub_label[0] : body.sub_label;
+  const severity = body.review_severity === "detection" ? "detection" : "alert";
+  const candidate: Record<string, unknown> = {
+    source: optionalString(body.source, 256) ?? "legacy-relay",
+    sourceSchema: "frigate-review-v1",
+    reviewId: optionalString(body.review_id, 256) ?? id,
+    reviewSeverity: severity,
+    eventId: id,
+    camera,
+    label,
+    detected_at: detectedAt,
+    score: typeof score === "number" ? score : 1,
+  };
+  if (Array.isArray(body.zones)) candidate.zones = body.zones;
+  const subLabel = optionalString(rawSubLabel, 128);
+  if (subLabel) candidate.sub_label = subLabel;
+  if (typeof body.stationary === "boolean") candidate.stationary = body.stationary;
+  if (typeof body.has_clip === "boolean") candidate.has_clip = body.has_clip;
+  const plate = optionalString(body.recognized_license_plate ?? body.recognized_plate, 64);
+  if (plate) candidate.recognized_plate = plate;
+  const description = optionalString(body.description, 500);
+  if (description) candidate.description = description;
+  if (typeof body.isEnrichment === "boolean") candidate.isEnrichment = body.isEnrichment;
+  const normalized = validateReviewEnvelope(candidate);
+  if (!normalized) return null;
+  const snapshot = optionalString(body.compressed_snapshot, 2_000_000);
+  if (snapshot) normalized.compressed_snapshot = snapshot;
+  const title = optionalString(body.custom_title, 256);
+  if (title) normalized.custom_title = title;
+  const text = optionalString(body.custom_body, 1024);
+  if (text) normalized.custom_body = text;
+  if (body.lumen_critical === true) normalized.legacyCritical = true;
+  return normalized;
 }
 
 function parseRoute(url: URL): { endpoint: string; secret: string; token: string; cam: string | null; sandbox: boolean; platform: string | null } | null {
@@ -644,7 +708,10 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
  * is wrong — only the user's own rules should decide. Default: never critical.
  */
 function shouldBeCritical(event: ReviewEnvelope, automationVerified: boolean): boolean {
-  return automationVerified && event.presentation?.disposition === "critical";
+  if (automationVerified) return event.presentation?.disposition === "critical";
+  // Published relays flag the user's own critical rule; keep honouring it
+  // until they send signed automation decisions.
+  return event.legacyCritical === true && event.automationSchema === undefined;
 }
 
 async function handleNotify(
@@ -659,10 +726,14 @@ async function handleNotify(
   } catch {
     return new Response("Bad request", { status: 400 });
   }
-  const event = validateReviewEnvelope(body);
-  if (!event) {
+  const normalized = normalizeNotifyBody(body);
+  if (normalized === "drop") {
+    return new Response("OK", { status: 200 });
+  }
+  if (!normalized) {
     return new Response("Bad request", { status: 400 });
   }
+  const event = normalized;
 
   if (route.cam && event.camera !== route.cam) {
     return new Response("OK", { status: 200 });

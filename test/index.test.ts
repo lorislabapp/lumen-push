@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import worker, { channelIDForSecret, sendAPNs, validateReviewEnvelope, verifyAutomationDecision, type Env } from "../src/index";
+import worker, { channelIDForSecret, normalizeNotifyBody, sendAPNs, validateReviewEnvelope, verifyAutomationDecision, type Env } from "../src/index";
 import { evaluateAndSignPolicy, validatePolicyUpload } from "../src/automation";
 import authorityFixture from "./fixtures/automation-authority-v1.json";
 
@@ -501,5 +501,67 @@ describe("Frigate Review producer contract", () => {
       decisionMAC: "0145b383409570bdd4577694daa4257eebd82efee8294d456c397f48810b3f30",
     } as const;
     expect(await verifyAutomationDecision(event, String.fromCharCode(...Array(32).fill(7)))).toBe(true);
+  });
+});
+
+describe("published relay payloads", () => {
+  const now = () => Date.now() / 1000;
+  const rawEvent = () => ({
+    id: "1726500000.1-abc", camera: "front_door", label: "person", top_score: 0.91,
+    zones: ["porch"], has_snapshot: true, has_clip: false, start_time: now(),
+    end_time: null, stationary: false, sub_label: ["Postman", 0.93],
+  });
+  const reviewEvent = () => ({
+    id: "1726500000.2-def", camera: "driveway", label: "car", top_score: 0.8, zones: [],
+    start_time: now(), detected_at: now(), review_id: "review-9", review_severity: "detection",
+    source_schema: "frigate-review-v1", recognized_license_plate: "AB123CD", lumen_critical: true,
+  });
+
+  it("maps a raw Frigate event onto the Review envelope", () => {
+    const event = normalizeNotifyBody(rawEvent());
+    expect(event).not.toBeNull();
+    expect(event).not.toBe("drop");
+    const envelope = event as Exclude<typeof event, "drop" | null>;
+    expect(envelope.reviewId).toBe("1726500000.1-abc");
+    expect(envelope.reviewSeverity).toBe("alert");
+    expect(envelope.score).toBe(0.91);
+    expect(envelope.sub_label).toBe("Postman");
+    expect(envelope.legacyCritical).toBeUndefined();
+  });
+
+  it("maps a snake_case review event and keeps the relay critical flag", () => {
+    const envelope = normalizeNotifyBody(reviewEvent()) as Exclude<ReturnType<typeof normalizeNotifyBody>, "drop" | null>;
+    expect(envelope.reviewId).toBe("review-9");
+    expect(envelope.reviewSeverity).toBe("detection");
+    expect(envelope.recognized_plate).toBe("AB123CD");
+    expect(envelope.legacyCritical).toBe(true);
+  });
+
+  it("drops low-confidence raw events like the v1 Worker", () => {
+    expect(normalizeNotifyBody({ ...rawEvent(), top_score: 0.3 })).toBe("drop");
+  });
+
+  it("never accepts the internal critical flag from a camelCase sender", () => {
+    expect(validateReviewEnvelope({
+      source: "relay", sourceSchema: "frigate-review-v1", reviewId: "r", reviewSeverity: "alert",
+      eventId: "e", camera: "c", label: "person", detected_at: now(), score: 0.9, legacyCritical: true,
+    })).toBeNull();
+  });
+
+  it("v1 and v2 notify routes accept published relay payloads", async () => {
+    vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => undefined } });
+    for (const body of [rawEvent(), reviewEvent()]) {
+      const { env } = makeEnv();
+      const v1 = await worker.fetch(new Request(`https://push.test/v1/notify/${"01".repeat(16)}/${"ab".repeat(32)}`, {
+        method: "POST", body: JSON.stringify(body),
+      }), env);
+      expect(v1.status).not.toBe(400);
+      const channel = await channelIDForSecret("0123456789abcdef0123456789abcdef");
+      const v2 = await worker.fetch(new Request(`https://push.test/v2/notify/${channel}`, {
+        method: "POST", body: JSON.stringify(body),
+      }), env);
+      expect(v2.status).not.toBe(400);
+    }
+    vi.unstubAllGlobals();
   });
 });
