@@ -9,16 +9,16 @@ Open-source Cloudflare Worker that relays [Frigate NVR](https://github.com/blake
 ```
 Frigate NVR
       |
-      |  MQTT event: frigate/events  (Frigate does not send HTTP webhooks natively)
+      |  MQTT: frigate/events + frigate/reviews
       v
 lumen-push-relay (this is a small container you run on your network)
       |  https://github.com/lorislabapp/lumen-push-relay
-      |  1. Subscribes to Frigate MQTT
+      |  1. Correlates Review Items with raw detection evidence
       |  2. Filters: labels, zones, confidence, cooldown, schedule
-      |  3. POSTs a compact JSON payload to the Cloudflare Worker
+      |  3. POSTs a canonical frigate-review-v1 envelope
       v
 Cloudflare Worker (this repo)
-      |  1. Validates event schema
+      |  1. Validates the Review schema and freshness
       |  2. Server-side filters (stationary, top_score < 0.5)
       |  3. Rate limits: 30s per device token (Cloudflare KV)
       |  4. Signs APNs JWT (ES256, cached 50min)
@@ -36,7 +36,7 @@ User sees notification (typically <1s end-to-end)
 ## How it works
 
 1. You run [`lumen-push-relay`](https://github.com/lorislabapp/lumen-push-relay) alongside Frigate — a small Python/Docker container that subscribes to Frigate's MQTT events.
-2. When Frigate detects something, the relay filters the event and POSTs a compact JSON payload to this Cloudflare Worker.
+2. When Frigate creates or updates a Review Item, the relay correlates it with the referenced detection, filters it, and POSTs a compact canonical payload to this Cloudflare Worker. Raw tracker events alone are never notification authority.
 3. The Worker validates, rate limits, signs an APNs JWT, and delivers the push to Apple.
 4. Your iPhone / iPad / Mac / Watch / Apple TV / Vision Pro receives the notification via Lumen.
 
@@ -57,38 +57,45 @@ User sees notification (typically <1s end-to-end)
 
 The push endpoint. `lumen-push-relay` POSTs here for each Frigate event that passes its filters. The URL is unique per Lumen device and is generated inside the app (Settings → Push Notifications → Copy URL).
 
-You can also POST to this endpoint directly from any tool (ntfy, n8n, a custom script, `curl`, etc.) — the Worker only cares about the JSON schema below.
+Custom producers may POST to this endpoint only if they implement the validated Review contract below. Legacy raw `frigate/events` payloads are rejected.
 
 **Query parameters:**
 - `?cam=<camera_name>` — Only forward events from this camera (free tier restriction)
 - `?sandbox=1` — Use APNs sandbox (development builds only)
 
-**Request body:** Standard Frigate webhook JSON:
+**Request body:** Canonical correlated Review envelope:
 ```json
 {
-  "type": "new",
-  "before": null,
-  "after": {
-    "id": "1710756000.123-abc",
-    "camera": "front_door",
-    "label": "person",
-    "top_score": 0.87,
-    "zones": ["porch"],
-    "has_snapshot": true,
-    "has_clip": true,
-    "start_time": 1710756000.123,
-    "end_time": null,
-    "stationary": false,
-    "sub_label": null
-  }
+  "source": "cloudflare-relay",
+  "sourceSchema": "frigate-review-v1",
+  "reviewId": "review-1710756000",
+  "reviewSeverity": "alert",
+  "eventId": "1710756000.123-abc",
+  "camera": "front_door",
+  "label": "person",
+  "detected_at": 1710756000.123,
+  "score": 0.87,
+  "zones": ["porch"]
 }
 ```
 
 **Filtering (server-side):**
-- Only `type: "new"` events are forwarded
-- Stationary objects are skipped
-- Events with `top_score < 0.5` are skipped
-- Rate limited to 1 push per 30 seconds per device token
+- Missing/malformed Review authority is rejected before APNs
+- Stale events and camera-route mismatches are rejected
+- Rate limiting is applied per device token
+- Signed Automation V4 decisions are accepted only when their MAC and active policy revision/hash match; suppression never calls APNs
+
+### `PUT /v2/channels/<channel-id>/automation-policy`
+
+The Lumen app synchronizes the canonical Automation V4 policy to this endpoint
+with the same `Bearer <push-secret>` proof used by device registration. The
+Worker verifies the exact SHA-256 hash and rejects unsupported always-on
+conditions or actions instead of applying a partial policy. Its per-channel
+decision key is envelope-encrypted with AES-GCM before KV persistence; the
+plaintext key and bearer are never logged or stored.
+
+`DELETE` on the same authenticated resource removes the policy and cooldown
+state when no always-on rule remains.
 
 **APNs payload sent:**
 ```json
@@ -149,6 +156,7 @@ npx wrangler secret put APNS_KEY_ID     # key ID from Apple Developer portal
 npx wrangler secret put APNS_TEAM_ID    # your Apple Developer team ID
 npx wrangler secret put APNS_BUNDLE_ID  # com.lorislab.lumenforfrigate (or your own bundle ID)
 npx wrangler secret put KILL_SWITCH     # "0" (set to "1" to instantly disable all pushes)
+npx wrangler secret put AUTOMATION_POLICY_KEK_B64 # base64 of 32 random bytes; wraps per-channel Automation keys in KV
 ```
 
 5. Deploy:

@@ -1,4 +1,9 @@
 import { classifyEvent } from "./classifier";
+import {
+  evaluateAndSignPolicy,
+  StoredAutomationPolicy,
+  validatePolicyUpload,
+} from "./automation";
 
 export interface Env {
   APNS_KEY: string;
@@ -10,6 +15,8 @@ export interface Env {
   // events are dropped as stale (MQTT replay, relay backlog, etc.). Set to "0"
   // to disable. Defaults to 120 if unset.
   MAX_EVENT_AGE_SECONDS?: string;
+  /** Corrections resolve minutes later; judged on their own clock. */
+  LATE_IDENTITY_MAX_AGE_SECONDS?: string;
   // Minimum gap (seconds) between consecutive pushes to the same APNs token.
   // Prevents runaway notification loops without dropping legitimate
   // consecutive detections. Defaults to 5 if unset (was 30 historically;
@@ -25,7 +32,7 @@ export interface Env {
   // Workers Analytics Engine dataset for per-user / per-country notification
   // stats. Optional so deploys without the binding still work (we no-op).
   // Schema (see writeStat): blob1=tokenPrefix, blob2=country, blob3=camera,
-  // blob4=label, blob5=outcome ("sent"|"rate_limited"), blob6=platform.
+  // blob4=label, blob5=outcome ("sent"|"rate_limited"|"failed"), blob6=platform.
   // double1=count(=1), double2=top_score. index1=tokenPrefix.
   NOTIF_STATS?: AnalyticsEngineDataset;
   // GET /stats?token=… page. Required for the HTML dashboard. Generated with
@@ -42,6 +49,19 @@ export interface Env {
   // skips Slack delivery (no-op). Set via
   // `wrangler secret put SLACK_WEBHOOK_URL` once the webhook is created.
   SLACK_WEBHOOK_URL?: string;
+  // Shared only with the always-on policy authority. Required before a
+  // lumen-automation-decision-v1 envelope can affect APNs presentation.
+  AUTOMATION_DECISION_KEY?: string;
+  // Preferred binary-safe representation for manually provisioned legacy
+  // authorities. Per-channel policies carry their own 32-byte base64 key.
+  AUTOMATION_DECISION_KEY_B64?: string;
+  // 32-byte base64 AES-GCM key used only to envelope per-channel decision
+  // keys before they enter KV. Must be provisioned as a Worker secret.
+  AUTOMATION_POLICY_KEK_B64?: string;
+  // Active policy acknowledgment from the authority. Automation decisions
+  // fail closed unless both values exactly match the signed envelope.
+  AUTOMATION_POLICY_REVISION?: string;
+  AUTOMATION_POLICY_HASH?: string;
 }
 
 /**
@@ -55,29 +75,124 @@ interface RegisteredDevice {
   registered_at: number; // Unix epoch seconds
 }
 
-interface FrigateEvent {
-  id: string;
+export interface ReviewEnvelope {
+  source: string;
+  sourceSchema: "frigate-review-v1";
+  reviewId: string;
+  reviewSeverity: "detection" | "alert";
+  eventId: string;
   camera: string;
   label: string;
-  top_score: number;
-  zones: string[];
-  has_snapshot: boolean;
-  has_clip: boolean;
-  start_time: number;
-  end_time: number | null;
-  stationary: boolean;
-  sub_label: string | null;
+  detected_at: number;
+  score: number;
+  zones?: string[];
+  sub_label?: string | null;
+  stationary?: boolean | null;
+  has_clip?: boolean;
+  recognized_plate?: string | null;
   compressed_snapshot?: string;  // Base64-encoded JPEG from relay pre-compression
-  // Set by the relay when the event matches the user's configured critical
-  // rule (critical cameras + schedule). Drives the critical interruption level
-  // instead of a hardcoded Worker heuristic. Absent/false => time-sensitive.
-  lumen_critical?: boolean;
+  /** Short human summary from Frigate (GenAI description or review title). */
+  description?: string | null;
+  /**
+   * A correction to a notification already on screen: a face resolved or a
+   * description written after the fact. Reuses the original collapse id so the
+   * banner is rewritten instead of alerting again.
+   */
+  isEnrichment?: boolean;
+  custom_title?: string;
+  custom_body?: string;
+  automationSchema?: string;
+  policyRevision?: number;
+  policyHash?: string;
+  ruleId?: string;
+  branchId?: string;
+  decisionId?: string;
+  presentation?: AutomationPresentation;
+  decisionMAC?: string;
 }
 
-interface FrigateWebhook {
-  type: string;
-  before: FrigateEvent | null;
-  after: FrigateEvent | null;
+interface AutomationPresentation {
+  disposition: "normal" | "critical" | "suppress";
+  priority: "normal" | "timeSensitive";
+  category?: string;
+  spokenTemplate?: string;
+  criticalVolume?: number;
+}
+
+function canonicalVolume(value: number | undefined): string {
+  if (value === undefined) return "";
+  return value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function automationSigningInput(event: ReviewEnvelope): string | null {
+  if (event.automationSchema !== "lumen-automation-decision-v1") return null;
+  if (!Number.isInteger(event.policyRevision) || (event.policyRevision ?? -1) < 0) return null;
+  if (!event.policyHash?.match(/^sha256:[0-9a-f]{64}$/)) return null;
+  if (!event.ruleId || !event.branchId || !event.decisionId || !event.presentation) return null;
+  if (event.decisionId !== `${event.reviewId}/${event.reviewSeverity}/${event.policyRevision}`) return null;
+  const p = event.presentation;
+  if (!["normal", "critical", "suppress"].includes(p.disposition)) return null;
+  if (!["normal", "timeSensitive"].includes(p.priority)) return null;
+  if (p.criticalVolume !== undefined && (!Number.isFinite(p.criticalVolume) || p.criticalVolume < 0 || p.criticalVolume > 1)) return null;
+  if (p.disposition === "critical" && (p.priority !== "timeSensitive" || p.criticalVolume === undefined)) return null;
+  if (p.disposition !== "critical" && p.criticalVolume !== undefined) return null;
+  if (p.category !== undefined && (p.category.length === 0 || p.category.length > 64)) return null;
+  if (p.spokenTemplate !== undefined && (p.spokenTemplate.length === 0 || p.spokenTemplate.length > 64)) return null;
+  return [
+    event.reviewId, event.reviewSeverity, event.eventId,
+    String(event.policyRevision), event.policyHash,
+    event.ruleId, event.branchId, event.decisionId,
+    p.disposition, p.priority, p.category ?? "", p.spokenTemplate ?? "",
+    canonicalVolume(p.criticalVolume),
+  ].join("\n");
+}
+
+function decodeBase64Key(value: string): Uint8Array | null {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return bytes.byteLength === 32 ? bytes : null;
+  } catch { return null; }
+}
+
+export async function verifyAutomationDecision(
+  event: ReviewEnvelope,
+  key: string | undefined,
+  keyBase64?: string,
+): Promise<boolean> {
+  const input = automationSigningInput(event);
+  const keyBytes = keyBase64 ? decodeBase64Key(keyBase64) : (key ? new TextEncoder().encode(key) : null);
+  if (!input || !keyBytes || !event.decisionMAC?.match(/^[0-9a-f]{64}$/)) return false;
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["verify"]
+  );
+  const signature = Uint8Array.from(event.decisionMAC.match(/../g) ?? [], (hex) => parseInt(hex, 16));
+  return crypto.subtle.verify("HMAC", cryptoKey, signature, new TextEncoder().encode(input));
+}
+
+export function validateReviewEnvelope(value: unknown): ReviewEnvelope | null {
+  if (!value || typeof value !== "object") return null;
+  const body = value as Record<string, unknown>;
+  if (body.sourceSchema !== "frigate-review-v1") return null;
+  if (body.reviewSeverity !== "detection" && body.reviewSeverity !== "alert") return null;
+  for (const key of ["source", "reviewId", "eventId", "camera", "label"] as const) {
+    if (typeof body[key] !== "string" || body[key].length === 0 || body[key].length > 256) return null;
+  }
+  if (typeof body.detected_at !== "number" || !Number.isFinite(body.detected_at) || body.detected_at <= 0) return null;
+  if (typeof body.score !== "number" || !Number.isFinite(body.score) || body.score < 0 || body.score > 1) return null;
+  if (body.zones !== undefined && (!Array.isArray(body.zones) || body.zones.length > 32 || body.zones.some((zone) => typeof zone !== "string" || zone.length === 0 || zone.length > 128))) return null;
+  if (body.sub_label !== undefined && body.sub_label !== null
+      && (typeof body.sub_label !== "string" || body.sub_label.length === 0 || body.sub_label.length > 128)) return null;
+  if (body.stationary !== undefined && body.stationary !== null && typeof body.stationary !== "boolean") return null;
+  if (body.has_clip !== undefined && typeof body.has_clip !== "boolean") return null;
+  if (body.recognized_plate !== undefined && body.recognized_plate !== null
+      && (typeof body.recognized_plate !== "string" || body.recognized_plate.length === 0 || body.recognized_plate.length > 64)) return null;
+  if (body.description !== undefined && body.description !== null
+      && (typeof body.description !== "string" || body.description.length === 0 || body.description.length > 500)) return null;
+  if (body.isEnrichment !== undefined && typeof body.isEnrichment !== "boolean") return null;
+  return body as unknown as ReviewEnvelope;
 }
 
 function parseRoute(url: URL): { endpoint: string; secret: string; token: string; cam: string | null; sandbox: boolean; platform: string | null } | null {
@@ -93,6 +208,27 @@ function parseRoute(url: URL): { endpoint: string; secret: string; token: string
   };
 }
 
+function parseV2Route(url: URL): { endpoint: "notify" | "devices" | "test" | "automation-policy"; channelID: string; cam: string | null } | null {
+  let match = url.pathname.match(/^\/v2\/notify\/([0-9a-f]{64})$/i);
+  if (match) return { endpoint: "notify", channelID: match[1].toLowerCase(), cam: url.searchParams.get("cam") };
+  match = url.pathname.match(/^\/v2\/channels\/([0-9a-f]{64})\/(devices|test|automation-policy)$/i);
+  if (!match) return null;
+  return { endpoint: match[2] as "devices" | "test" | "automation-policy", channelID: match[1].toLowerCase(), cam: null };
+}
+
+export async function channelIDForSecret(secret: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function authorizeChannel(request: Request, channelID: string): Promise<boolean> {
+  const authorization = request.headers.get("Authorization") ?? "";
+  if (!authorization.startsWith("Bearer ")) return false;
+  const secret = authorization.slice(7);
+  if (!/^[0-9a-f]{32}$/i.test(secret)) return false;
+  return (await channelIDForSecret(secret)) === channelID;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (env.KILL_SWITCH === "1") {
@@ -100,6 +236,21 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // V2 snapshot URLs are random bearer capabilities, single-use, and
+    // explicitly non-cacheable. Event ids are never exposed in the URL.
+    if (request.method === "GET") {
+      const snapshot = url.pathname.match(/^\/v2\/snapshots\/([0-9a-f]{64})$/i);
+      if (snapshot) {
+        const key = `snapshot-v2:${snapshot[1].toLowerCase()}`;
+        const compressed = await env.RATE_LIMIT.get(key);
+        if (!compressed) return new Response("Not found", { status: 404 });
+        await env.RATE_LIMIT.delete(key);
+        return new Response(compressed, {
+          headers: { "Content-Type": "text/plain", "Cache-Control": "no-store, private" },
+        });
+      }
+    }
 
     // Stats dashboard (GET, secret-guarded). Lives outside the POST-only
     // /v1/* surface because it's a read-only diagnostic page.
@@ -111,22 +262,41 @@ export default {
     // compressed snapshot was too large to embed in the APNs payload.
     // Shape: /snapshot/<event-id>
     if (request.method === "GET" && url.pathname.startsWith("/snapshot/")) {
-      const eventId = url.pathname.slice("/snapshot/".length);
-      if (!eventId || eventId.length < 8) {
-        return new Response("Bad request", { status: 400 });
+      return new Response("Legacy snapshot endpoint removed", { status: 410 });
+    }
+
+    const v2 = parseV2Route(url);
+    if (v2) {
+      if (v2.endpoint === "automation-policy" && request.method === "PUT") {
+        return handleAutomationPolicyPut(request, v2.channelID, env);
       }
-      const snapshotKey = `snapshot:${eventId}`;
-      const compressed = await env.RATE_LIMIT.get(snapshotKey);
-      if (!compressed) {
-        return new Response("Not found", { status: 404 });
+      if (v2.endpoint === "automation-policy" && request.method === "DELETE") {
+        return handleAutomationPolicyDelete(request, v2.channelID, env);
       }
-      // Return the base64-encoded JPEG. The NSE will decode it.
-      return new Response(compressed, {
-        headers: {
-          "Content-Type": "text/plain",
-          "Cache-Control": "public, max-age=3600",
-        },
-      });
+      if (request.method === "POST" && v2.endpoint === "devices") {
+        return handleV2Device(request, v2.channelID, env, false);
+      }
+      if (request.method === "DELETE" && v2.endpoint === "devices") {
+        return handleV2Device(request, v2.channelID, env, true);
+      }
+      if (request.method === "POST" && v2.endpoint === "test") {
+        if (!(await authorizeChannel(request, v2.channelID))) return new Response("Unauthorized", { status: 401 });
+        const devices = await readDevices(v2.channelID, env);
+        if (devices.length === 0) return new Response("No registered devices", { status: 409 });
+        const results = await Promise.all(
+          devices.map((device) => handleTest(device.token, device.sandbox, env))
+        );
+        return results.some((result) => result.ok)
+          ? new Response("OK", { status: 200 })
+          : new Response("APNs test delivery failed", { status: 502 });
+      }
+      if (request.method === "POST" && v2.endpoint === "notify") {
+        const country = request.headers.get("CF-IPCountry") ?? "??";
+        return handleNotify(request, {
+          secret: v2.channelID, token: "", cam: v2.cam, sandbox: false,
+        }, country, env);
+      }
+      return new Response("Method not allowed", { status: 405 });
     }
 
     if (request.method !== "POST") {
@@ -200,6 +370,120 @@ async function writeDevices(secret: string, list: RegisteredDevice[], env: Env):
   await env.DEVICES.put(`devices:${secret}`, JSON.stringify(list));
 }
 
+const automationPolicyKey = (channelID: string) => `automation-policy:${channelID}`;
+const automationCooldownKey = (channelID: string) => `automation-cooldown:${channelID}`;
+
+type PersistedAutomationPolicy = Omit<StoredAutomationPolicy, "decisionKeyBase64"> & {
+  decisionKeyCiphertext: string;
+  decisionKeyIV: string;
+};
+
+function bytesToBase64(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes));
+}
+
+function base64ToBytes(value: string): Uint8Array | null {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+    return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+  } catch { return null; }
+}
+
+function policyAAD(
+  channelID: string,
+  policy: Pick<StoredAutomationPolicy, "revision" | "hash" | "timeZone">
+): Uint8Array {
+  return new TextEncoder().encode(`${channelID}\n${policy.revision}\n${policy.hash}\n${policy.timeZone}`);
+}
+
+async function encryptAutomationPolicy(
+  channelID: string, policy: StoredAutomationPolicy, env: Env,
+): Promise<PersistedAutomationPolicy | null> {
+  const kek = env.AUTOMATION_POLICY_KEK_B64 ? base64ToBytes(env.AUTOMATION_POLICY_KEK_B64) : null;
+  const decisionKey = base64ToBytes(policy.decisionKeyBase64);
+  if (!kek || kek.byteLength !== 32 || !decisionKey || decisionKey.byteLength !== 32) return null;
+  const cryptoKey = await crypto.subtle.importKey("raw", kek, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: policyAAD(channelID, policy) }, cryptoKey, decisionKey,
+  );
+  const { decisionKeyBase64: _, ...safe } = policy;
+  return {
+    ...safe,
+    decisionKeyCiphertext: bytesToBase64(new Uint8Array(ciphertext)),
+    decisionKeyIV: bytesToBase64(iv),
+  };
+}
+
+async function decryptAutomationPolicy(
+  channelID: string, policy: PersistedAutomationPolicy, env: Env,
+): Promise<StoredAutomationPolicy | null> {
+  const kek = env.AUTOMATION_POLICY_KEK_B64 ? base64ToBytes(env.AUTOMATION_POLICY_KEK_B64) : null;
+  const iv = base64ToBytes(policy.decisionKeyIV);
+  const ciphertext = base64ToBytes(policy.decisionKeyCiphertext);
+  if (!kek || kek.byteLength !== 32 || !iv || iv.byteLength !== 12 || !ciphertext) return null;
+  try {
+    const cryptoKey = await crypto.subtle.importKey("raw", kek, "AES-GCM", false, ["decrypt"]);
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv, additionalData: policyAAD(channelID, policy) }, cryptoKey, ciphertext,
+    );
+    const decisionKey = new Uint8Array(plaintext);
+    if (decisionKey.byteLength !== 32) return null;
+    const { decisionKeyCiphertext: _, decisionKeyIV: __, ...record } = policy;
+    return { ...record, decisionKeyBase64: bytesToBase64(decisionKey) };
+  } catch { return null; }
+}
+
+async function readAutomationPolicy(channelID: string, env: Env): Promise<StoredAutomationPolicy | null> {
+  const raw = await env.DEVICES.get(automationPolicyKey(channelID));
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as PersistedAutomationPolicy;
+    return value.schema === "lumen-automation-policy-v1"
+      ? await decryptAutomationPolicy(channelID, value, env) : null;
+  } catch { return null; }
+}
+
+async function handleAutomationPolicyPut(request: Request, channelID: string, env: Env): Promise<Response> {
+  if (!(await authorizeChannel(request, channelID))) return new Response("Unauthorized", { status: 401 });
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (contentLength > 180_000) return new Response("Payload too large", { status: 413 });
+  let body: unknown;
+  try { body = await request.json(); } catch { return new Response("Bad request", { status: 400 }); }
+  const record = await validatePolicyUpload(body);
+  if (!record) return new Response("Unsupported or invalid automation policy", { status: 422 });
+  const encrypted = await encryptAutomationPolicy(channelID, record, env);
+  if (!encrypted) return new Response("Automation key encryption unavailable", { status: 503 });
+  await env.DEVICES.put(automationPolicyKey(channelID), JSON.stringify(encrypted));
+  await env.DEVICES.delete(automationCooldownKey(channelID));
+  return new Response(JSON.stringify({ ok: true, revision: record.revision, hash: record.hash }), {
+    status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}
+
+async function handleAutomationPolicyDelete(request: Request, channelID: string, env: Env): Promise<Response> {
+  if (!(await authorizeChannel(request, channelID))) return new Response("Unauthorized", { status: 401 });
+  await Promise.all([
+    env.DEVICES.delete(automationPolicyKey(channelID)),
+    env.DEVICES.delete(automationCooldownKey(channelID)),
+  ]);
+  return new Response(null, { status: 204 });
+}
+
+async function readAutomationCooldown(channelID: string, env: Env): Promise<Map<string, number>> {
+  const raw = await env.DEVICES.get(automationCooldownKey(channelID));
+  if (!raw) return new Map();
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    return new Map(Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === "number"));
+  } catch { return new Map(); }
+}
+
+async function writeAutomationCooldown(channelID: string, state: Map<string, number>, env: Env): Promise<void> {
+  await env.DEVICES.put(automationCooldownKey(channelID), JSON.stringify(Object.fromEntries(state)));
+}
+
 async function handleRegister(
   route: { secret: string; token: string; sandbox: boolean; platform: string | null },
   env: Env
@@ -246,6 +530,45 @@ async function handleUnregister(
     JSON.stringify({ ok: true, device_count: filtered.length }),
     { status: 200, headers: { "content-type": "application/json" } }
   );
+}
+
+async function handleV2Device(
+  request: Request,
+  channelID: string,
+  env: Env,
+  remove: boolean
+): Promise<Response> {
+  if (!(await authorizeChannel(request, channelID))) return new Response("Unauthorized", { status: 401 });
+  let body: { token?: unknown; sandbox?: unknown; platform?: unknown };
+  try { body = await request.json<typeof body>(); } catch { return new Response("Bad request", { status: 400 }); }
+  if (typeof body.token !== "string" || !/^[0-9a-f]{32,128}$/i.test(body.token)) {
+    return new Response("Bad request", { status: 400 });
+  }
+  const devices = await readDevices(channelID, env);
+  if (remove) {
+    await writeDevices(channelID, devices.filter((device) => device.token !== body.token), env);
+    return new Response(null, { status: 204 });
+  }
+  if (typeof body.sandbox !== "boolean") return new Response("Bad request", { status: 400 });
+  const record: RegisteredDevice = {
+    token: body.token,
+    sandbox: body.sandbox,
+    platform: typeof body.platform === "string" ? body.platform.slice(0, 16) : undefined,
+    registered_at: Math.floor(Date.now() / 1000),
+  };
+  const index = devices.findIndex((device) => device.token === record.token);
+  if (index >= 0) devices[index] = record;
+  else {
+    if (devices.length >= MAX_DEVICES_PER_SECRET) {
+      devices.sort((a, b) => a.registered_at - b.registered_at);
+      devices.shift();
+    }
+    devices.push(record);
+  }
+  await writeDevices(channelID, devices, env);
+  return new Response(JSON.stringify({ ok: true, device_count: devices.length }), {
+    status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
 }
 
 /**
@@ -302,8 +625,9 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
     source: "cloudflare-relay-test",
   };
 
-  await sendAPNs(token, payload, sandbox, env);
-  return new Response("OK", { status: 200 });
+  return await sendAPNs(token, payload, sandbox, env)
+    ? new Response("OK", { status: 200 })
+    : new Response("APNs test delivery failed", { status: 502 });
 }
 
 /**
@@ -319,8 +643,8 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
  * made benign detections (e.g. a mail delivery) bypass Do Not Disturb, which
  * is wrong — only the user's own rules should decide. Default: never critical.
  */
-function shouldBeCritical(event: FrigateEvent): boolean {
-  return event.lumen_critical === true;
+function shouldBeCritical(event: ReviewEnvelope, automationVerified: boolean): boolean {
+  return automationVerified && event.presentation?.disposition === "critical";
 }
 
 async function handleNotify(
@@ -329,19 +653,14 @@ async function handleNotify(
   country: string,
   env: Env
 ): Promise<Response> {
-  let body: FrigateWebhook;
+  let body: unknown;
   try {
-    body = await request.json<FrigateWebhook>();
+    body = await request.json();
   } catch {
     return new Response("Bad request", { status: 400 });
   }
-
-  if (body.type !== "new") {
-    return new Response("OK", { status: 200 });
-  }
-
-  const event = body.after;
-  if (!event?.id || !event?.camera || !event?.label || event?.top_score === undefined) {
+  const event = validateReviewEnvelope(body);
+  if (!event) {
     return new Response("Bad request", { status: 400 });
   }
 
@@ -349,25 +668,79 @@ async function handleNotify(
     return new Response("OK", { status: 200 });
   }
 
-  if (event.stationary) {
-    return new Response("OK", { status: 200 });
+  const policyChannelID = /^[0-9a-f]{64}$/i.test(route.secret) ? route.secret.toLowerCase() : null;
+  const storedChannelPolicy = policyChannelID
+    ? await env.DEVICES.get(automationPolicyKey(policyChannelID)) : null;
+  const channelPolicy = policyChannelID && storedChannelPolicy
+    ? await readAutomationPolicy(policyChannelID, env) : null;
+  // Stored policy corruption, AAD tampering, or a missing KEK must fail closed.
+  // Falling back to unsigned delivery would turn a storage/configuration fault
+  // into an automation bypass.
+  if (storedChannelPolicy && !channelPolicy) {
+    return new Response("Automation policy unavailable", { status: 503 });
+  }
+  let cooldownState: Map<string, number> | null = null;
+  if (channelPolicy) {
+    cooldownState = await readAutomationCooldown(route.secret.toLowerCase(), env);
+    let decision;
+    try {
+      decision = await evaluateAndSignPolicy(channelPolicy, event, cooldownState);
+    } catch {
+      return new Response("Automation policy cannot evaluate this event", { status: 422 });
+    }
+    if (!decision) return new Response("Automation policy unavailable", { status: 503 });
+    Object.assign(event, decision);
+    if (decision.presentation.disposition === "suppress") {
+      await writeAutomationCooldown(route.secret.toLowerCase(), cooldownState, env);
+      return new Response("Suppressed by automation policy", { status: 200 });
+    }
   }
 
-  if (event.top_score < 0.5) {
-    return new Response("OK", { status: 200 });
+  const carriesAutomation = event.automationSchema !== undefined
+    || event.decisionMAC !== undefined || event.presentation !== undefined;
+  const automationPolicyActive = channelPolicy !== null || env.AUTOMATION_POLICY_REVISION !== undefined
+    || env.AUTOMATION_POLICY_HASH !== undefined;
+  if (automationPolicyActive && !carriesAutomation) {
+    return new Response("Automation decision required", { status: 428 });
+  }
+  const automationVerified = carriesAutomation
+    ? await verifyAutomationDecision(
+      event,
+      channelPolicy ? undefined : env.AUTOMATION_DECISION_KEY,
+      channelPolicy?.decisionKeyBase64 ?? env.AUTOMATION_DECISION_KEY_B64,
+    )
+    : false;
+  if (carriesAutomation && !automationVerified) {
+    return new Response("Invalid automation decision", { status: 400 });
+  }
+  if (automationVerified) {
+    const activeRevision = channelPolicy?.revision ?? Number(env.AUTOMATION_POLICY_REVISION);
+    const activeHash = channelPolicy?.hash ?? env.AUTOMATION_POLICY_HASH;
+    if (!Number.isInteger(activeRevision)
+        || activeRevision !== event.policyRevision
+        || !activeHash
+        || activeHash !== event.policyHash) {
+      return new Response("Automation policy out of date", { status: 409 });
+    }
+  }
+  // A suppress decision is an invariant violation: the authority must never
+  // submit it to the Worker and the Worker must never call APNs for it.
+  if (automationVerified && event.presentation?.disposition === "suppress") {
+    return new Response("Suppressed", { status: 422 });
   }
 
-  // Drop stale events. Guards against MQTT replay, relay backlog, or any
-  // upstream queue that could produce a "fake-fresh" push for something that
-  // actually happened hours ago. `start_time` is Unix epoch seconds. We skip
-  // the check when start_time is missing/zero so malformed events still get
-  // forwarded (matches relay.py behavior).
-  const maxAgeStr = env.MAX_EVENT_AGE_SECONDS ?? "120";
+  // Reject stale and future-dated envelopes again at the APNs boundary.
+  // A correction is asynchronous by nature: Frigate can take a minute to put a
+  // name to a face. Judging it by the detection's age would drop exactly the
+  // messages this feature exists to deliver.
+  const maxAgeStr = event.isEnrichment
+    ? (env.LATE_IDENTITY_MAX_AGE_SECONDS ?? "600")
+    : (env.MAX_EVENT_AGE_SECONDS ?? "120");
   const maxAge = parseInt(maxAgeStr, 10);
-  if (maxAge > 0 && typeof event.start_time === "number" && event.start_time > 0) {
-    const ageSeconds = Date.now() / 1000 - event.start_time;
-    if (ageSeconds > maxAge) {
-      console.log(`Dropping stale event ${event.id}: age=${ageSeconds.toFixed(0)}s max=${maxAge}s`);
+  if (maxAge > 0) {
+    const ageSeconds = Date.now() / 1000 - event.detected_at;
+    if (ageSeconds > maxAge || ageSeconds < -30) {
+      console.log(`Dropping stale/future Review ${event.reviewId}: age=${ageSeconds.toFixed(0)}s max=${maxAge}s`);
       return new Response("OK", { status: 200 });
     }
   }
@@ -378,9 +751,9 @@ async function handleNotify(
     label: event.label,
     camera: event.camera,
     zones: event.zones || [],
-    top_score: event.top_score,
-    start_time: event.start_time,
-    stationary: event.stationary,
+    top_score: event.score,
+    start_time: event.detected_at,
+    stationary: false,
   });
 
   // Build APNs payload
@@ -391,42 +764,70 @@ async function handleNotify(
   if (event.zones?.length) {
     bodyParts.push(`Zone: ${event.zones.join(", ")}`);
   }
-  bodyParts.push(`Confidence: ${Math.round(event.top_score * 100)}%`);
+  bodyParts.push(`Confidence: ${Math.round(event.score * 100)}%`);
 
   // Determine priority and interruption level based on detection characteristics.
   // Critical alerts bypass Do Not Disturb and require the entitlement (granted 2026-04-28).
-  const isCritical = shouldBeCritical(event);
-  const interruptionLevel = isCritical ? "critical" : "time-sensitive";
-  const sound = isCritical ? "critical" : "default";
+  const isCritical = shouldBeCritical(event, automationVerified);
+  const interruptionLevel = isCritical
+    ? "critical"
+    : (automationVerified && event.presentation?.priority === "normal" ? "active" : "time-sensitive");
+  const sound: string | Record<string, unknown> = isCritical
+    ? {
+      critical: 1,
+      name: "default",
+      volume: event.presentation?.criticalVolume ?? 1,
+    }
+    : "default";
   const priority = isCritical ? 10 : 10;  // Both use highest priority for now
 
   const apnsPayload: Record<string, unknown> = {
     aps: {
       alert: {
-        title: `${label} Detected`,
+        title: event.custom_title ?? `${label} Detected`,
         subtitle: cameraName,
-        body: bodyParts.join(" | "),
+        // A sentence describing what happened beats a list of zone/score
+        // fragments; the NSE still gets both and decides for itself.
+        body: event.custom_body ?? event.description ?? bodyParts.join(" | "),
       },
-      sound,
-      "interruption-level": interruptionLevel,
-      category: "FRIGATE_EVENT",
+      sound: event.isEnrichment ? undefined : sound,
+      "interruption-level": event.isEnrichment ? "passive" : interruptionLevel,
+      category: automationVerified ? (event.presentation?.category ?? "FRIGATE_EVENT") : "FRIGATE_EVENT",
       "thread-id": event.camera,
       "mutable-content": 1,
     },
-    eventId: event.id,
+    eventId: event.eventId,
+    sourceSchema: event.sourceSchema,
+    reviewId: event.reviewId,
+    reviewSeverity: event.reviewSeverity,
+    ...(automationVerified ? {
+      automationSchema: event.automationSchema,
+      policyRevision: event.policyRevision,
+      policyHash: event.policyHash,
+      ruleId: event.ruleId,
+      branchId: event.branchId,
+      decisionId: event.decisionId,
+      presentation: event.presentation,
+      decisionMAC: event.decisionMAC,
+    } : {}),
     camera: event.camera,
     label: event.label,
     zones: event.zones || [],
     // Forwarded so the NSE rules engine can evaluate scoreAtLeast and
     // subLabelEquals leaves on closed-app pushes (rules engine is otherwise
     // limited to camera/label/zones/time when running in the extension).
-    top_score: event.top_score,
+    top_score: event.score,
     sub_label: event.sub_label,
+    stationary: event.stationary,
+    has_clip: event.has_clip,
+    recognized_plate: event.recognized_plate,
+    description: event.description,
+    isEnrichment: event.isEnrichment ?? false,
     // Unix epoch seconds of Frigate detection. The NSE uses this to show the
     // user "detected Xs ago" so real-time pushes can be visually distinguished
     // from pushes APNs held while the device was unreachable.
-    detected_at: event.start_time,
-    source: "cloudflare-relay",
+    detected_at: event.detected_at,
+    source: event.source,
     // AI classification (Phase 1: rule-based, Phase 2: Worker AI)
     // NSE applyAIClassification() uses this to render bilingual templates
     classification,
@@ -443,16 +844,17 @@ async function handleNotify(
     if (payloadSize < 4096) {
       // Fits in APNs payload — embed directly (zero NSE download latency)
       apnsPayload.compressed_snapshot = event.compressed_snapshot;
-      console.log(`Embedded snapshot for ${event.camera}/${event.id}: ${payloadSize} bytes`);
+      console.log(`Embedded snapshot for ${event.camera}/${event.eventId}: ${payloadSize} bytes`);
     } else {
-      // Too large — store in KV with 1h TTL, include full URL for NSE
-      const snapshotKey = `snapshot:${event.id}`;
+      // Too large — store behind a random, single-use, non-cacheable URL.
+      const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
+      const nonce = Array.from(nonceBytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      const snapshotKey = `snapshot-v2:${nonce}`;
       await env.RATE_LIMIT.put(snapshotKey, event.compressed_snapshot, { expirationTtl: 3600 });
-      // Construct full URL for NSE: https://<worker-host>/snapshot/<event-id>
       const workerOrigin = new URL(request.url).origin;
-      const snapshotURL = `${workerOrigin}/snapshot/${event.id}`;
+      const snapshotURL = `${workerOrigin}/v2/snapshots/${nonce}`;
       apnsPayload.compressed_snapshot_url = snapshotURL;
-      console.log(`Stored snapshot in KV for ${event.camera}/${event.id}: ${payloadSize} bytes → ${snapshotURL}`);
+      console.log(`Stored one-time snapshot for ${event.camera}: ${payloadSize} bytes`);
     }
   }
 
@@ -464,6 +866,9 @@ async function handleNotify(
   // If no devices are registered (pre-fan-out client still using the single
   // URL token), fall back to that URL token so existing setups keep working.
   const registered = await readDevices(route.secret, env);
+  if (registered.length === 0 && route.token.length === 0) {
+    return new Response("No registered devices", { status: 409 });
+  }
   const targets: RegisteredDevice[] = registered.length > 0
     ? registered
     : [{ token: route.token, sandbox: route.sandbox, registered_at: 0 }];
@@ -471,7 +876,7 @@ async function handleNotify(
   const meta: NotifyMeta = {
     camera: event.camera,
     label: event.label,
-    topScore: event.top_score,
+    topScore: event.score,
     country,
   };
 
@@ -481,13 +886,19 @@ async function handleNotify(
   // ("lumen-<eventId>"), so iOS also replaces a WebSocket-path local notif
   // with this remote push instead of stacking them. Loss-free: only merges
   // identical-event notifications, never drops a distinct alert. 64-byte APNs cap.
-  const collapseId = `lumen-${event.id}`.slice(0, 64);
+  const collapseId = `lumen-${event.reviewId}-${event.reviewSeverity}`.slice(0, 64);
 
-  await Promise.all(
+  const deliveryOutcomes = await Promise.all(
     targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority, collapseId))
   );
+  const terminalDelivery = deliveryOutcomes.some((outcome) => outcome !== "failed");
+  if (channelPolicy && cooldownState && terminalDelivery) {
+    await writeAutomationCooldown(route.secret.toLowerCase(), cooldownState, env);
+  }
 
-  return new Response("OK", { status: 200 });
+  return terminalDelivery
+    ? new Response("OK", { status: 200 })
+    : new Response("APNs delivery failed", { status: 502 });
 }
 
 interface NotifyMeta {
@@ -510,7 +921,7 @@ function writeStat(
   env: Env,
   device: RegisteredDevice,
   meta: NotifyMeta,
-  outcome: "sent" | "rate_limited"
+  outcome: DeliveryOutcome
 ): void {
   if (!env.NOTIF_STATS) return;
   const userKey = device.token.slice(0, 8);
@@ -530,10 +941,12 @@ function writeStat(
 
 /**
  * Send the APNs payload to one device, honouring a per-token 30s rate limit.
- * Returns silently if rate-limited or if APNs errors — errors are logged in
- * sendAPNs. This way one failing device does not block other targets in the
- * same Promise.all fan-out.
+ * Returns a typed outcome so the request boundary can distinguish intentional
+ * rate limiting from an actual APNs failure. One failing device still does not
+ * block successful targets in the same Promise.all fan-out.
  */
+export type DeliveryOutcome = "sent" | "rate_limited" | "failed";
+
 async function sendToDeviceRateLimited(
   device: RegisteredDevice,
   payload: unknown,
@@ -541,7 +954,7 @@ async function sendToDeviceRateLimited(
   env: Env,
   priority: number = 10,
   collapseId?: string
-): Promise<void> {
+): Promise<DeliveryOutcome> {
   // Per-device rate limit: 5s minimum gap between pushes to the same
   // APNs token. Was 30s — too aggressive for security cameras where
   // a single intrusion can fire 5+ legitimate events in <30s. Users
@@ -559,12 +972,18 @@ async function sendToDeviceRateLimited(
     const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
     if (elapsed < minIntervalSeconds) {
       writeStat(env, device, meta, "rate_limited");
-      return;
+      return "rate_limited";
     }
   }
-  await rateLimitPut("rl", device.token, String(Date.now()), 60);
-  await sendAPNs(device.token, payload, device.sandbox, env, priority, collapseId);
-  writeStat(env, device, meta, "sent");
+  const delivered = await sendAPNs(device.token, payload, device.sandbox, env, priority, collapseId);
+  const outcome: DeliveryOutcome = delivered ? "sent" : "failed";
+  if (delivered) {
+    // A failed attempt must remain retryable. Consuming the rate-limit token
+    // before APNs accepts the request silently loses the relay retry.
+    await rateLimitPut("rl", device.token, String(Date.now()), 60);
+  }
+  writeStat(env, device, meta, outcome);
+  return outcome;
 }
 
 // --- APNs JWT signing and delivery ---
@@ -648,14 +1067,14 @@ function derToRaw(der: Uint8Array): Uint8Array {
   return raw;
 }
 
-async function sendAPNs(
+export async function sendAPNs(
   token: string,
   payload: unknown,
   sandbox: boolean,
   env: Env,
   priority: number = 10,
   collapseId?: string
-): Promise<void> {
+): Promise<boolean> {
   try {
     const jwt = await getAPNsJWT(env);
     const apnsHost = sandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
@@ -691,9 +1110,12 @@ async function sendAPNs(
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
       console.error(`APNs error ${response.status}: ${errText}`);
+      return false;
     }
+    return true;
   } catch (e) {
     console.error(`APNs request failed: ${e}`);
+    return false;
   }
 }
 
@@ -1083,4 +1505,3 @@ ${countryLines}`;
     body: JSON.stringify({ text }),
   });
 }
-
