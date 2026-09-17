@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import worker, { channelIDForSecret, normalizeNotifyBody, sendAPNs, validateReviewEnvelope, verifyAutomationDecision, type Env } from "../src/index";
+import worker, { channelIDForSecret, isDeadTokenResponse, normalizeNotifyBody, sendAPNs, validateReviewEnvelope, verifyAutomationDecision, type Env } from "../src/index";
 import { evaluateAndSignPolicy, validatePolicyUpload } from "../src/automation";
 import authorityFixture from "./fixtures/automation-authority-v1.json";
 
@@ -573,5 +573,47 @@ describe("published relay payloads", () => {
       expect(v2.status).not.toBe(400);
     }
     vi.unstubAllGlobals();
+  });
+});
+
+describe("channel status", () => {
+  const secret = "0123456789abcdef0123456789abcdef";
+
+  it("requires the channel secret", async () => {
+    const { env } = makeEnv();
+    const channel = await channelIDForSecret(secret);
+    const response = await worker.fetch(new Request(`https://push.test/v2/channels/${channel}/status`), env);
+    expect(response.status).toBe(401);
+  });
+
+  it("reports devices, this device and the last relay outcome, including silent drops", async () => {
+    const { env, devices } = makeEnv();
+    const channel = await channelIDForSecret(secret);
+    await devices.put(`devices:${channel}`, JSON.stringify([{ token: "ab".repeat(32), sandbox: false, platform: "ios", registered_at: 1 }]));
+    const stale = { type: "new", before: null, after: {
+      id: "old-1", camera: "front", label: "person", top_score: 0.9, zones: [], start_time: Date.now() / 1000 - 3600,
+    } };
+    const notify = await worker.fetch(new Request(`https://push.test/v2/notify/${channel}`, {
+      method: "POST", headers: { "User-Agent": "lumen-push-relay/test" }, body: JSON.stringify(stale),
+    }), env);
+    expect(notify.status).toBe(200);
+
+    const response = await worker.fetch(new Request(`https://push.test/v2/channels/${channel}/status?token=${"ab".repeat(32)}`, {
+      headers: { Authorization: `Bearer ${secret}` },
+    }), env);
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, any>;
+    expect(body.deviceCount).toBe(1);
+    expect(body.thisDevice).toEqual({ registered: true, sandbox: false });
+    expect(body.devices[0].tokenSuffix).toBe("ababab");
+    expect(body.lastNotify.status).toBe(200);
+    expect(body.lastNotify.userAgent).toBe("lumen-push-relay/test");
+  });
+
+  it("recognises tokens APNs will never accept again", () => {
+    expect(isDeadTokenResponse(410, '{"reason":"Unregistered"}')).toBe(true);
+    expect(isDeadTokenResponse(400, '{"reason":"BadDeviceToken"}')).toBe(true);
+    expect(isDeadTokenResponse(400, '{"reason":"DeviceTokenNotForTopic"}')).toBe(false);
+    expect(isDeadTokenResponse(503, "")).toBe(false);
   });
 });

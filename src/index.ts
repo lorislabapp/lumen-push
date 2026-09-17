@@ -278,12 +278,12 @@ function parseRoute(url: URL): { endpoint: string; secret: string; token: string
   };
 }
 
-function parseV2Route(url: URL): { endpoint: "notify" | "devices" | "test" | "automation-policy"; channelID: string; cam: string | null } | null {
+function parseV2Route(url: URL): { endpoint: "notify" | "devices" | "test" | "automation-policy" | "status"; channelID: string; cam: string | null } | null {
   let match = url.pathname.match(/^\/v2\/notify\/([0-9a-f]{64})$/i);
   if (match) return { endpoint: "notify", channelID: match[1].toLowerCase(), cam: url.searchParams.get("cam") };
-  match = url.pathname.match(/^\/v2\/channels\/([0-9a-f]{64})\/(devices|test|automation-policy)$/i);
+  match = url.pathname.match(/^\/v2\/channels\/([0-9a-f]{64})\/(devices|test|automation-policy|status)$/i);
   if (!match) return null;
-  return { endpoint: match[2] as "devices" | "test" | "automation-policy", channelID: match[1].toLowerCase(), cam: null };
+  return { endpoint: match[2] as "devices" | "test" | "automation-policy" | "status", channelID: match[1].toLowerCase(), cam: null };
 }
 
 export async function channelIDForSecret(secret: string): Promise<string> {
@@ -360,11 +360,17 @@ export default {
           ? new Response("OK", { status: 200 })
           : new Response("APNs test delivery failed", { status: 502 });
       }
+      if (request.method === "GET" && v2.endpoint === "status") {
+        if (!(await authorizeChannel(request, v2.channelID))) return new Response("Unauthorized", { status: 401 });
+        return handleChannelStatus(v2.channelID, url.searchParams.get("token"), env);
+      }
       if (request.method === "POST" && v2.endpoint === "notify") {
         const country = request.headers.get("CF-IPCountry") ?? "??";
-        return handleNotify(request, {
+        const response = await handleNotify(request, {
           secret: v2.channelID, token: "", cam: v2.cam, sandbox: false,
         }, country, env);
+        await recordNotifyOutcome(v2.channelID, response, request.headers.get("User-Agent"), env);
+        return response;
       }
       return new Response("Method not allowed", { status: 405 });
     }
@@ -402,7 +408,9 @@ export default {
     // server). It approximates where the user's NVR — and so the user — is
     // located. Used for per-country notification stats.
     const country = request.headers.get("CF-IPCountry") ?? "??";
-    return handleNotify(request, route, country, env);
+    const response = await handleNotify(request, route, country, env);
+    await recordNotifyOutcome(await channelIDForSecret(route.secret), response, request.headers.get("User-Agent"), env);
+    return response;
   },
 
   // Daily Cron-triggered Slack digest. Wired in wrangler.toml as
@@ -438,6 +446,72 @@ async function readDevices(secret: string, env: Env): Promise<RegisteredDevice[]
 
 async function writeDevices(secret: string, list: RegisteredDevice[], env: Env): Promise<void> {
   await env.DEVICES.put(`devices:${secret}`, JSON.stringify(list));
+}
+
+// --- Channel status (what the app's push doctor reads) ---
+
+export interface NotifyOutcomeRecord {
+  status: number;
+  reason: string;
+  at: number;
+  userAgent: string | null;
+}
+
+const notifyStatusKey = (channelID: string) => `notify-status:${channelID}`;
+
+/**
+ * Remembers the latest answer the Worker gave a relay for this channel,
+ * including the silent 200 drops (stale event, low score, camera filter,
+ * suppressed). Written only when the outcome changes or once a minute, so a
+ * busy camera does not turn every event into a KV write.
+ */
+export async function recordNotifyOutcome(channelID: string, response: Response, userAgent: string | null, env: Env): Promise<void> {
+  try {
+    const reason = (await response.clone().text()).slice(0, 120);
+    const now = Date.now();
+    const key = notifyStatusKey(channelID.toLowerCase());
+    const previousRaw = await env.DEVICES.get(key);
+    if (previousRaw) {
+      const previous = JSON.parse(previousRaw) as NotifyOutcomeRecord;
+      if (previous.status === response.status && previous.reason === reason && now - previous.at < 60_000) return;
+    }
+    const record: NotifyOutcomeRecord = { status: response.status, reason, at: now, userAgent: userAgent?.slice(0, 120) ?? null };
+    await env.DEVICES.put(key, JSON.stringify(record), { expirationTtl: 30 * 24 * 3600 });
+  } catch {
+    // Diagnostics must never affect delivery.
+  }
+}
+
+async function handleChannelStatus(channelID: string, token: string | null, env: Env): Promise<Response> {
+  const devices = await readDevices(channelID, env);
+  const lastRaw = await env.DEVICES.get(notifyStatusKey(channelID));
+  let lastNotify: NotifyOutcomeRecord | null = null;
+  try { lastNotify = lastRaw ? JSON.parse(lastRaw) as NotifyOutcomeRecord : null; } catch { lastNotify = null; }
+  const body = {
+    channel: channelID.slice(0, 8),
+    deviceCount: devices.length,
+    devices: devices.map((device) => ({
+      platform: device.platform ?? null,
+      sandbox: device.sandbox,
+      registeredAt: device.registered_at,
+      tokenSuffix: device.token.slice(-6),
+    })),
+    thisDevice: token
+      ? (() => {
+          const match = devices.find((device) => device.token === token);
+          return { registered: Boolean(match), sandbox: match?.sandbox ?? null };
+        })()
+      : null,
+    lastNotify,
+  };
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store, private" },
+  });
+}
+
+/** APNs says the token will never work again: stop fanning out to it. */
+export function isDeadTokenResponse(status: number, reason: string): boolean {
+  return status === 410 || (status === 400 && /"BadDeviceToken"/.test(reason));
 }
 
 const automationPolicyKey = (channelID: string) => `automation-policy:${channelID}`;
@@ -968,7 +1042,11 @@ async function handleNotify(
   const deliveryOutcomes = await Promise.all(
     targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority, collapseId))
   );
-  const terminalDelivery = deliveryOutcomes.some((outcome) => outcome !== "failed");
+  const deadTokens = new Set(targets.filter((_, index) => deliveryOutcomes[index] === "dead").map((device) => device.token));
+  if (deadTokens.size > 0 && registered.length > 0) {
+    await writeDevices(route.secret, registered.filter((device) => !deadTokens.has(device.token)), env);
+  }
+  const terminalDelivery = deliveryOutcomes.some((outcome) => outcome === "sent" || outcome === "rate_limited");
   if (channelPolicy && cooldownState && terminalDelivery) {
     await writeAutomationCooldown(route.secret.toLowerCase(), cooldownState, env);
   }
@@ -1022,7 +1100,7 @@ function writeStat(
  * rate limiting from an actual APNs failure. One failing device still does not
  * block successful targets in the same Promise.all fan-out.
  */
-export type DeliveryOutcome = "sent" | "rate_limited" | "failed";
+export type DeliveryOutcome = "sent" | "rate_limited" | "failed" | "dead";
 
 async function sendToDeviceRateLimited(
   device: RegisteredDevice,
@@ -1052,14 +1130,15 @@ async function sendToDeviceRateLimited(
       return "rate_limited";
     }
   }
-  const delivered = await sendAPNs(device.token, payload, device.sandbox, env, priority, collapseId);
-  const outcome: DeliveryOutcome = delivered ? "sent" : "failed";
+  const result = await sendAPNsDetailed(device.token, payload, device.sandbox, env, priority, collapseId);
+  const delivered = result.ok;
+  const outcome: DeliveryOutcome = delivered ? "sent" : (isDeadTokenResponse(result.status, result.reason) ? "dead" : "failed");
   if (delivered) {
     // A failed attempt must remain retryable. Consuming the rate-limit token
     // before APNs accepts the request silently loses the relay retry.
     await rateLimitPut("rl", device.token, String(Date.now()), 60);
   }
-  writeStat(env, device, meta, outcome);
+  writeStat(env, device, meta, outcome === "dead" ? "failed" : outcome);
   return outcome;
 }
 
@@ -1152,6 +1231,17 @@ export async function sendAPNs(
   priority: number = 10,
   collapseId?: string
 ): Promise<boolean> {
+  return (await sendAPNsDetailed(token, payload, sandbox, env, priority, collapseId)).ok;
+}
+
+async function sendAPNsDetailed(
+  token: string,
+  payload: unknown,
+  sandbox: boolean,
+  env: Env,
+  priority: number = 10,
+  collapseId?: string
+): Promise<{ ok: boolean; status: number; reason: string }> {
   try {
     const jwt = await getAPNsJWT(env);
     const apnsHost = sandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
@@ -1187,12 +1277,12 @@ export async function sendAPNs(
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
       console.error(`APNs error ${response.status}: ${errText}`);
-      return false;
+      return { ok: false, status: response.status, reason: errText };
     }
-    return true;
+    return { ok: true, status: response.status, reason: "" };
   } catch (e) {
     console.error(`APNs request failed: ${e}`);
-    return false;
+    return { ok: false, status: 0, reason: String(e) };
   }
 }
 
