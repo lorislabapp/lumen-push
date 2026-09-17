@@ -548,9 +548,19 @@ describe("published relay payloads", () => {
     })).toBeNull();
   });
 
+  it("unwraps the published relay's MQTT envelope", () => {
+    const wrapped = { type: "new", before: null, after: rawEvent() };
+    const envelope = normalizeNotifyBody(wrapped) as Exclude<ReturnType<typeof normalizeNotifyBody>, "drop" | null>;
+    expect(envelope?.eventId).toBe("1726500000.1-abc");
+    expect(normalizeNotifyBody({ type: "update", before: rawEvent(), after: reviewEvent() })).not.toBeNull();
+    expect(normalizeNotifyBody({ type: "end", before: rawEvent(), after: rawEvent() })).toBe("drop");
+  });
+
   it("v1 and v2 notify routes accept published relay payloads", async () => {
     vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => undefined } });
-    for (const body of [rawEvent(), reviewEvent()]) {
+    for (const body of [rawEvent(), reviewEvent(),
+      { type: "new", before: null, after: rawEvent() },
+      { type: "new", before: null, after: reviewEvent() }]) {
       const { env } = makeEnv();
       const v1 = await worker.fetch(new Request(`https://push.test/v1/notify/${"01".repeat(16)}/${"ab".repeat(32)}`, {
         method: "POST", body: JSON.stringify(body),

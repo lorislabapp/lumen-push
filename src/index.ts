@@ -212,7 +212,13 @@ export function normalizeNotifyBody(value: unknown): ReviewEnvelope | "drop" | n
   const envelope = validateReviewEnvelope(value);
   if (envelope) return envelope;
   if (!value || typeof value !== "object") return null;
-  const body = value as Record<string, unknown>;
+  let body = value as Record<string, unknown>;
+  // The published relay forwards Frigate's MQTT shape verbatim:
+  // {"type":"new","before":null,"after":{...event}}. Unwrap it.
+  if (typeof body.type === "string" && body.after && typeof body.after === "object") {
+    if (body.type === "end") return "drop";
+    body = body.after as Record<string, unknown>;
+  }
   if ("sourceSchema" in body || "legacyCritical" in body) return null;
   const id = optionalString(body.id, 256);
   const camera = optionalString(body.camera, 256);
