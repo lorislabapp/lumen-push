@@ -99,8 +99,6 @@ export interface ReviewEnvelope {
    * banner is rewritten instead of alerting again.
    */
   isEnrichment?: boolean;
-  /** Set only by normalizeNotifyBody for a published relay's lumen_critical flag. */
-  legacyCritical?: boolean;
   custom_title?: string;
   custom_body?: string;
   automationSchema?: string;
@@ -206,7 +204,8 @@ function optionalString(value: unknown, max: number): string | undefined {
  * Relays already running in the field post snake_case Frigate events
  * (`top_score`, `start_time`, optional `review_id` / `source_schema`), not the
  * camelCase Review envelope. Map them onto the envelope so one Worker serves
- * both; returns "drop" for low-confidence events the v1 Worker also ignored.
+ * both without manufacturing Review IDs, severity or confidence. Raw relays
+ * must migrate to correlated Review envelopes before this Worker is deployed.
  */
 export function normalizeNotifyBody(value: unknown): ReviewEnvelope | "drop" | null {
   const envelope = validateReviewEnvelope(value);
@@ -226,22 +225,24 @@ export function normalizeNotifyBody(value: unknown): ReviewEnvelope | "drop" | n
   if (!id || !camera || !label) return null;
   const score = body.top_score;
   if (score !== undefined && (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 1)) return null;
-  const isReview = body.source_schema === "frigate-review-v1";
-  if (score === undefined && !isReview) return null;
-  if (typeof score === "number" && score < 0.5) return "drop";
+  // Compatibility changes spelling only: raw objects are never Review authority.
+  if (body.source_schema !== "frigate-review-v1"
+      || !optionalString(body.review_id, 256)
+      || (body.review_severity !== "alert" && body.review_severity !== "detection")
+      || typeof score !== "number") return null;
   const detectedAt = typeof body.detected_at === "number" ? body.detected_at : body.start_time;
   const rawSubLabel = Array.isArray(body.sub_label) ? body.sub_label[0] : body.sub_label;
-  const severity = body.review_severity === "detection" ? "detection" : "alert";
+  const severity = body.review_severity;
   const candidate: Record<string, unknown> = {
     source: optionalString(body.source, 256) ?? "legacy-relay",
     sourceSchema: "frigate-review-v1",
-    reviewId: optionalString(body.review_id, 256) ?? id,
+    reviewId: body.review_id,
     reviewSeverity: severity,
     eventId: id,
     camera,
     label,
     detected_at: detectedAt,
-    score: typeof score === "number" ? score : 1,
+    score,
   };
   if (Array.isArray(body.zones)) candidate.zones = body.zones;
   const subLabel = optionalString(rawSubLabel, 128);
@@ -261,7 +262,6 @@ export function normalizeNotifyBody(value: unknown): ReviewEnvelope | "drop" | n
   if (title) normalized.custom_title = title;
   const text = optionalString(body.custom_body, 1024);
   if (text) normalized.custom_body = text;
-  if (body.lumen_critical === true) normalized.legacyCritical = true;
   return normalized;
 }
 
@@ -774,24 +774,9 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
     : new Response("APNs test delivery failed", { status: 502 });
 }
 
-/**
- * Determine if a detection should be delivered as a critical alert.
- *
- * Critical alerts bypass Do Not Disturb and require the critical-alerts
- * entitlement (granted 2026-04-28).
- *
- * Criticality is now driven by the USER's configuration, not a hardcoded
- * heuristic. The relay (which holds the per-user config — critical cameras,
- * zones, schedules) sets `lumen_critical: true` on events that match the
- * user's critical rule. The previous "person >= 85% => critical" heuristic
- * made benign detections (e.g. a mail delivery) bypass Do Not Disturb, which
- * is wrong — only the user's own rules should decide. Default: never critical.
- */
+/** Critical presentation requires an authenticated policy decision. */
 function shouldBeCritical(event: ReviewEnvelope, automationVerified: boolean): boolean {
-  if (automationVerified) return event.presentation?.disposition === "critical";
-  // Published relays flag the user's own critical rule; keep honouring it
-  // until they send signed automation decisions.
-  return event.legacyCritical === true && event.automationSchema === undefined;
+  return automationVerified && event.presentation?.disposition === "critical";
 }
 
 async function handleNotify(
@@ -811,7 +796,7 @@ async function handleNotify(
     return new Response("OK", { status: 200 });
   }
   if (!normalized) {
-    return new Response("Bad request", { status: 400 });
+    return new Response("Correlated Frigate Review envelope required; upgrade the relay", { status: 400 });
   }
   const event = normalized;
 
@@ -904,7 +889,7 @@ async function handleNotify(
     zones: event.zones || [],
     top_score: event.score,
     start_time: event.detected_at,
-    stationary: false,
+    stationary: event.stationary ?? false,
   });
 
   // Build APNs payload
@@ -1031,22 +1016,20 @@ async function handleNotify(
     country,
   };
 
-  // apns-collapse-id: coalesce notifications for the SAME Frigate event so the
-  // user never sees one detection twice (Michel L 2026-06: "notifications
-  // coming in duplicate"). Matches the app's local-notification identifier
-  // ("lumen-<eventId>"), so iOS also replaces a WebSocket-path local notif
-  // with this remote push instead of stacking them. Loss-free: only merges
-  // identical-event notifications, never drops a distinct alert. 64-byte APNs cap.
-  const collapseId = `lumen-${event.reviewId}-${event.reviewSeverity}`.slice(0, 64);
+  // Stable 64-byte identity per channel, Review and severity. APNs may coalesce
+  // remote notifications; this does not deduplicate independently scheduled
+  // local notifications or guarantee exactly-once delivery. Receipts below
+  // prevent repeat sends after a known successful acceptance.
+  const collapseId = await channelIDForSecret(JSON.stringify([route.secret, event.reviewId, event.reviewSeverity]));
 
   const deliveryOutcomes = await Promise.all(
-    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority, collapseId))
+    targets.map((device) => sendToDeviceRateLimited(device, apnsPayload, meta, env, priority, collapseId, event.isEnrichment === true))
   );
   const deadTokens = new Set(targets.filter((_, index) => deliveryOutcomes[index] === "dead").map((device) => device.token));
   if (deadTokens.size > 0 && registered.length > 0) {
     await writeDevices(route.secret, registered.filter((device) => !deadTokens.has(device.token)), env);
   }
-  const terminalDelivery = deliveryOutcomes.some((outcome) => outcome === "sent" || outcome === "rate_limited");
+  const terminalDelivery = deliveryOutcomes.every((outcome) => outcome === "sent" || outcome === "rate_limited" || outcome === "duplicate");
   if (channelPolicy && cooldownState && terminalDelivery) {
     await writeAutomationCooldown(route.secret.toLowerCase(), cooldownState, env);
   }
@@ -1100,16 +1083,44 @@ function writeStat(
  * rate limiting from an actual APNs failure. One failing device still does not
  * block successful targets in the same Promise.all fan-out.
  */
-export type DeliveryOutcome = "sent" | "rate_limited" | "failed" | "dead";
+export type DeliveryOutcome = "sent" | "rate_limited" | "duplicate" | "failed" | "dead";
 
+// Coalesce simultaneous retries in one isolate. Persisted receipts cover
+// later retries; cross-region exactly-once delivery is not provided by KV.
+const inFlightDeliveries = new Map<string, Promise<DeliveryOutcome>>();
 async function sendToDeviceRateLimited(
+  device: RegisteredDevice, payload: unknown, meta: NotifyMeta, env: Env,
+  priority = 10, collapseId?: string, enrichment = false,
+): Promise<DeliveryOutcome> {
+  if (!collapseId) return deliverToDevice(device, payload, meta, env, priority, collapseId, enrichment);
+  const key = JSON.stringify([env.APNS_BUNDLE_ID, device.token, device.sandbox, collapseId, enrichment]);
+  const existing = inFlightDeliveries.get(key);
+  if (existing) return existing;
+  if (inFlightDeliveries.size >= 4096) return "failed";
+  const delivery = deliverToDevice(device, payload, meta, env, priority, collapseId, enrichment);
+  inFlightDeliveries.set(key, delivery);
+  try { return await delivery; }
+  finally { inFlightDeliveries.delete(key); }
+}
+
+async function deliverToDevice(
   device: RegisteredDevice,
   payload: unknown,
   meta: NotifyMeta,
   env: Env,
   priority: number = 10,
-  collapseId?: string
+  collapseId?: string,
+  enrichment = false,
 ): Promise<DeliveryOutcome> {
+  // Per-device receipts keep retries from re-alerting devices that already
+  // succeeded during partial fan-out. KV is eventually consistent; the relay's
+  // persisted Review dedupe remains the primary authority across regions.
+  const receipt = collapseId ? `review-delivered:${device.token}:${collapseId}` : null;
+  const deliveryKey = receipt ? `${receipt}:${enrichment ? "enrichment" : "initial"}` : null;
+  if (enrichment && receipt && !await env.RATE_LIMIT.get(`${receipt}:initial`)) {
+    return "duplicate"; // A correction must never create a previously suppressed alert.
+  }
+  if (deliveryKey && await env.RATE_LIMIT.get(deliveryKey)) return "duplicate";
   // Per-device rate limit: 5s minimum gap between pushes to the same
   // APNs token. Was 30s — too aggressive for security cameras where
   // a single intrusion can fire 5+ legitimate events in <30s. Users
@@ -1123,7 +1134,7 @@ async function sendToDeviceRateLimited(
   // different cadence.
   const minIntervalSeconds = parseInt(env.RATE_LIMIT_SECONDS ?? "5", 10);
   const lastPush = await rateLimitGet("rl", device.token);
-  if (lastPush) {
+  if (lastPush && !enrichment) {
     const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
     if (elapsed < minIntervalSeconds) {
       writeStat(env, device, meta, "rate_limited");
@@ -1134,9 +1145,10 @@ async function sendToDeviceRateLimited(
   const delivered = result.ok;
   const outcome: DeliveryOutcome = delivered ? "sent" : (isDeadTokenResponse(result.status, result.reason) ? "dead" : "failed");
   if (delivered) {
+    if (deliveryKey) await env.RATE_LIMIT.put(deliveryKey, "1", { expirationTtl: 86400 });
     // A failed attempt must remain retryable. Consuming the rate-limit token
     // before APNs accepts the request silently loses the relay retry.
-    await rateLimitPut("rl", device.token, String(Date.now()), 60);
+    if (!enrichment) await rateLimitPut("rl", device.token, String(Date.now()), 60);
   }
   writeStat(env, device, meta, outcome === "dead" ? "failed" : outcome);
   return outcome;
@@ -1258,9 +1270,8 @@ async function sendAPNsDetailed(
       "apns-expiration": String(expiresAt),
       "content-type": "application/json",
     };
-    // Dedupe: pushes for the same Frigate event replace each other (and the
-    // app's matching local notification) instead of stacking. See the notify
-    // handler where collapseId is derived.
+    // Allow APNs to coalesce this Review's remote notifications. This header
+    // does not cancel a separately scheduled local notification.
     if (collapseId) {
       headers["apns-collapse-id"] = collapseId;
     }
