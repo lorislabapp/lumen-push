@@ -517,28 +517,18 @@ describe("published relay payloads", () => {
     source_schema: "frigate-review-v1", recognized_license_plate: "AB123CD", lumen_critical: true,
   });
 
-  it("maps a raw Frigate event onto the Review envelope", () => {
-    const event = normalizeNotifyBody(rawEvent());
-    expect(event).not.toBeNull();
-    expect(event).not.toBe("drop");
-    const envelope = event as Exclude<typeof event, "drop" | null>;
-    expect(envelope.reviewId).toBe("1726500000.1-abc");
-    expect(envelope.reviewSeverity).toBe("alert");
-    expect(envelope.score).toBe(0.91);
-    expect(envelope.sub_label).toBe("Postman");
-    expect(envelope.legacyCritical).toBeUndefined();
+  it("rejects raw objects instead of manufacturing Review authority", () => {
+    expect(normalizeNotifyBody(rawEvent())).toBeNull();
+    expect(normalizeNotifyBody({ ...rawEvent(), top_score: 0.3 })).toBeNull();
+    expect(normalizeNotifyBody({ ...reviewEvent(), review_id: undefined })).toBeNull();
+    expect(normalizeNotifyBody({ ...reviewEvent(), review_severity: undefined })).toBeNull();
+    expect(normalizeNotifyBody({ ...reviewEvent(), top_score: undefined })).toBeNull();
   });
 
-  it("maps a snake_case review event and keeps the relay critical flag", () => {
-    const envelope = normalizeNotifyBody(reviewEvent()) as Exclude<ReturnType<typeof normalizeNotifyBody>, "drop" | null>;
-    expect(envelope.reviewId).toBe("review-9");
-    expect(envelope.reviewSeverity).toBe("detection");
-    expect(envelope.recognized_plate).toBe("AB123CD");
-    expect(envelope.legacyCritical).toBe(true);
-  });
-
-  it("drops low-confidence raw events like the v1 Worker", () => {
-    expect(normalizeNotifyBody({ ...rawEvent(), top_score: 0.3 })).toBe("drop");
+  it("maps an explicit snake_case Review without unsigned critical promotion", () => {
+    const envelope = normalizeNotifyBody(reviewEvent());
+    expect(envelope).toMatchObject({ reviewId: "review-9", reviewSeverity: "detection", recognized_plate: "AB123CD" });
+    expect(envelope).not.toHaveProperty("legacyCritical");
   });
 
   it("never accepts the internal critical flag from a camelCase sender", () => {
@@ -550,13 +540,12 @@ describe("published relay payloads", () => {
 
   it("unwraps the published relay's MQTT envelope", () => {
     const wrapped = { type: "new", before: null, after: rawEvent() };
-    const envelope = normalizeNotifyBody(wrapped) as Exclude<ReturnType<typeof normalizeNotifyBody>, "drop" | null>;
-    expect(envelope?.eventId).toBe("1726500000.1-abc");
+    expect(normalizeNotifyBody(wrapped)).toBeNull();
     expect(normalizeNotifyBody({ type: "update", before: rawEvent(), after: reviewEvent() })).not.toBeNull();
     expect(normalizeNotifyBody({ type: "end", before: rawEvent(), after: rawEvent() })).toBe("drop");
   });
 
-  it("v1 and v2 notify routes accept published relay payloads", async () => {
+  it("v1 and v2 accept correlated Reviews and reject raw relays", async () => {
     vi.stubGlobal("caches", { default: { match: async () => undefined, put: async () => undefined } });
     for (const body of [rawEvent(), reviewEvent(),
       { type: "new", before: null, after: rawEvent() },
@@ -565,12 +554,13 @@ describe("published relay payloads", () => {
       const v1 = await worker.fetch(new Request(`https://push.test/v1/notify/${"01".repeat(16)}/${"ab".repeat(32)}`, {
         method: "POST", body: JSON.stringify(body),
       }), env);
-      expect(v1.status).not.toBe(400);
+      const correlated = "source_schema" in body || ("after" in body && "source_schema" in body.after);
+      expect(v1.status === 400).toBe(!correlated);
       const channel = await channelIDForSecret("0123456789abcdef0123456789abcdef");
       const v2 = await worker.fetch(new Request(`https://push.test/v2/notify/${channel}`, {
         method: "POST", body: JSON.stringify(body),
       }), env);
-      expect(v2.status).not.toBe(400);
+      expect(v2.status === 400).toBe(!correlated);
     }
     vi.unstubAllGlobals();
   });
@@ -596,7 +586,7 @@ describe("channel status", () => {
     const notify = await worker.fetch(new Request(`https://push.test/v2/notify/${channel}`, {
       method: "POST", headers: { "User-Agent": "lumen-push-relay/test" }, body: JSON.stringify(stale),
     }), env);
-    expect(notify.status).toBe(200);
+    expect(notify.status).toBe(400);
 
     const response = await worker.fetch(new Request(`https://push.test/v2/channels/${channel}/status?token=${"ab".repeat(32)}`, {
       headers: { Authorization: `Bearer ${secret}` },
@@ -606,7 +596,7 @@ describe("channel status", () => {
     expect(body.deviceCount).toBe(1);
     expect(body.thisDevice).toEqual({ registered: true, sandbox: false });
     expect(body.devices[0].tokenSuffix).toBe("ababab");
-    expect(body.lastNotify.status).toBe(200);
+    expect(body.lastNotify.status).toBe(400);
     expect(body.lastNotify.userAgent).toBe("lumen-push-relay/test");
   });
 

@@ -1,0 +1,15 @@
+{
+  "source": "cloudflare-relay",
+  "sourceSchema": "frigate-review-v1",
+  "reviewId": "fixture-review",
+  "reviewSeverity": "alert",
+  "eventId": "fixture-car",
+  "camera": "fixture-camera",
+  "label": "car",
+  "detected_at": 1789934959.058236,
+  "score": 0.75,
+  "zones": [
+    "driveway"
+  ],
+  "stationary": false
+}
