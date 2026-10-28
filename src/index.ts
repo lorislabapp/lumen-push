@@ -18,12 +18,17 @@ export interface Env {
   MAX_EVENT_AGE_SECONDS?: string;
   /** Corrections resolve minutes later; judged on their own clock. */
   LATE_IDENTITY_MAX_AGE_SECONDS?: string;
-  // Minimum gap (seconds) between consecutive pushes to the same APNs token.
-  // Prevents runaway notification loops without dropping legitimate
-  // consecutive detections. Defaults to 5 if unset (was 30 historically;
-  // 30 was too aggressive for security cameras — see commit message).
+  // Minimum gap (seconds) between consecutive pushes to the same APNs token
+  // FOR THE SAME CAMERA. Prevents runaway notification loops without dropping
+  // legitimate detections; another camera is never throttled by this one.
+  // Defaults to 5 if unset (was 30 historically; 30 was too aggressive).
   RATE_LIMIT_SECONDS?: string;
   RATE_LIMIT: KVNamespace;
+  // "1" opts in to keeping ONE last-notify record per channel (HTTP status,
+  // Worker reason code, time; 30-day TTL) for the in-app Push Doctor. Off by
+  // default: the published privacy statement says no delivery history is kept,
+  // so enabling it needs that statement updated first.
+  LAST_NOTIFY_RETENTION?: string;
   // Phase 1 multi-device fan-out: maps `secret` -> list of registered devices.
   // Populated via POST /v1/register. Consumed by handleNotify to fan out
   // a single Frigate event to every device that shares the secret. If empty
@@ -107,6 +112,11 @@ export interface ReviewEnvelope {
   isEnrichment?: boolean;
   custom_title?: string;
   custom_body?: string;
+  /**
+   * Optional human camera name chosen by the user (e.g. "Back Porch"). Sanitized
+   * on receipt; when absent the prettified camera id is used as before.
+   */
+  camera_display_name?: string;
   automationSchema?: string;
   policyRevision?: number;
   policyHash?: string;
@@ -178,6 +188,25 @@ export async function verifyAutomationDecision(
   return crypto.subtle.verify("HMAC", cryptoKey, signature, new TextEncoder().encode(input));
 }
 
+const CAMERA_DISPLAY_NAME_MAX = 64;
+
+/**
+ * Bounded, presentation-safe camera display name. Control and bidi-override
+ * characters become spaces, whitespace collapses, result is trimmed and capped
+ * at 64 code points. Anything unusable yields undefined so the alert still
+ * goes out with the prettified camera id (an optional cosmetic field must
+ * never drop a security notification).
+ */
+export function sanitizeCameraDisplayName(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 1024) return undefined;
+  const cleaned = value
+    .replace(/[\p{Cc}\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const bounded = Array.from(cleaned).slice(0, CAMERA_DISPLAY_NAME_MAX).join("").trim();
+  return bounded.length > 0 ? bounded : undefined;
+}
+
 export function validateReviewEnvelope(value: unknown): ReviewEnvelope | null {
   if (!value || typeof value !== "object") return null;
   const body = value as Record<string, unknown>;
@@ -206,6 +235,11 @@ export function validateReviewEnvelope(value: unknown): ReviewEnvelope | null {
       && (typeof body.compressed_snapshot !== "string" || body.compressed_snapshot.length === 0
         || body.compressed_snapshot.length > 131_072)) return null;
   if (body.legacyCritical !== undefined) return null;
+  if ("camera_display_name" in body) {
+    const displayName = sanitizeCameraDisplayName(body.camera_display_name);
+    if (displayName) body.camera_display_name = displayName;
+    else delete body.camera_display_name;
+  }
   return body as unknown as ReviewEnvelope;
 }
 
@@ -295,6 +329,7 @@ export function normalizeNotifyBody(value: unknown): ReviewEnvelope | "drop" | n
   const description = optionalString(body.description, 500);
   if (description) candidate.description = description;
   if (typeof body.isEnrichment === "boolean") candidate.isEnrichment = body.isEnrichment;
+  if (body.camera_display_name !== undefined) candidate.camera_display_name = body.camera_display_name;
   const normalized = validateReviewEnvelope(candidate);
   if (!normalized) return null;
   const snapshot = optionalString(body.compressed_snapshot, 2_000_000);
@@ -439,11 +474,9 @@ export default {
         const devices = await readDevices(v2.channelID, env);
         if (devices.length === 0) return new Response("No registered devices", { status: 409 });
         const results = await Promise.all(
-          devices.map((device) => handleTest(device.token, device.sandbox, env))
+          devices.map((device) => runTest(device.token, device.sandbox, env))
         );
-        return results.some((result) => result.ok)
-          ? new Response("OK", { status: 200 })
-          : new Response("APNs test delivery failed", { status: 502 });
+        return testResponse(results);
       }
       if (request.method === "GET" && v2.endpoint === "status") {
         if (!(await authorizeChannel(request, v2.channelID))) return new Response("Unauthorized", { status: 401 });
@@ -454,7 +487,7 @@ export default {
         const response = await handleNotify(request, {
           secret: v2.channelID, token: "", cam: v2.cam, sandbox: false,
         }, env);
-
+        await recordLastNotify(v2.channelID, response, env);
         return response;
       }
       return new Response("Method not allowed", { status: 405 });
@@ -478,7 +511,7 @@ export default {
     }
 
     if (route.endpoint === "test") {
-      return handleTest(route.token, route.sandbox, env);
+      return testResponse([await runTest(route.token, route.sandbox, env)]);
     }
 
     if (route.endpoint === "register") {
@@ -522,7 +555,8 @@ async function writeDevices(secret: string, list: RegisteredDevice[], env: Env):
 
 async function handleChannelStatus(channelID: string, token: string | null, env: Env): Promise<Response> {
   const devices = await readDevices(channelID, env);
-  const lastNotify = null; // No server-side per-channel delivery history.
+  const retained = lastNotifyRetentionEnabled(env);
+  const lastNotify = retained ? await readLastNotify(channelID, env) : null;
   const body = {
     channel: channelID.slice(0, 8),
     deviceCount: devices.length,
@@ -539,11 +573,69 @@ async function handleChannelStatus(channelID: string, token: string | null, env:
         })()
       : null,
     lastNotify,
-    deliveryHistoryRetained: false,
+    // When opted in, only the single most recent notify outcome is kept (status,
+    // Worker reason code, time) - no camera, label, event id, token or user agent.
+    deliveryHistoryRetained: retained,
+    ...(retained ? { lastNotifyRetentionSeconds: LAST_NOTIFY_TTL_SECONDS } : {}),
   };
   return new Response(JSON.stringify(body), {
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store, private" },
   });
+}
+
+// --- Last notify outcome (Push Doctor) ---
+
+const lastNotifyKey = (channelID: string) => `last-notify:${channelID}`;
+const LAST_NOTIFY_TTL_SECONDS = 30 * 86_400;
+const LAST_NOTIFY_WRITE_INTERVAL_SECONDS = 60;
+
+interface LastNotifyRecord { status: number; reason: string; at: number }
+
+function lastNotifyRetentionEnabled(env: Env): boolean {
+  return env.LAST_NOTIFY_RETENTION === "1";
+}
+
+async function readLastNotify(channelID: string, env: Env): Promise<(LastNotifyRecord & { userAgent: null }) | null> {
+  const raw = await env.DEVICES.get(lastNotifyKey(channelID));
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as Partial<LastNotifyRecord>;
+    if (typeof value.status !== "number" || typeof value.reason !== "string" || typeof value.at !== "number") return null;
+    return { status: value.status, reason: value.reason, at: value.at, userAgent: null };
+  } catch { return null; }
+}
+
+/** Worker-authored reason only: JSON `reason`, else first outcome, else the fixed error text. */
+async function lastNotifyReason(response: Response): Promise<string> {
+  const text = await response.clone().text().catch(() => "");
+  try {
+    const body = JSON.parse(text) as { reason?: unknown; delivered?: unknown; outcomes?: Array<{ outcome?: unknown; reason?: unknown }> };
+    if (typeof body.reason === "string") return body.reason.slice(0, 120);
+    if (typeof body.delivered === "number" && body.delivered > 0) return "delivered";
+    const first = body.outcomes?.find((entry) => entry.outcome !== "sent");
+    if (first && typeof first.outcome === "string") {
+      return `${first.outcome}${typeof first.reason === "string" ? `:${first.reason}` : ""}`.slice(0, 120);
+    }
+    return "no_targets";
+  } catch {
+    return text.slice(0, 120);
+  }
+}
+
+/**
+ * Persist the latest notify outcome for the channel's Push Doctor. At most one
+ * KV write per channel per minute (per colo, gated by the Cache API), never
+ * for a channel with no registered devices, and never able to affect delivery.
+ */
+async function recordLastNotify(channelID: string, response: Response, env: Env): Promise<void> {
+  if (!lastNotifyRetentionEnabled(env)) return;
+  try {
+    if (await rateLimitGet("last-notify", channelID)) return;
+    if ((await readDevices(channelID, env)).length === 0) return;
+    const record: LastNotifyRecord = { status: response.status, reason: await lastNotifyReason(response), at: Date.now() };
+    await env.DEVICES.put(lastNotifyKey(channelID), JSON.stringify(record), { expirationTtl: LAST_NOTIFY_TTL_SECONDS });
+    await rateLimitPut("last-notify", channelID, String(record.at), LAST_NOTIFY_WRITE_INTERVAL_SECONDS);
+  } catch { /* diagnostics only */ }
 }
 
 /** APNs says the token will never work again: stop fanning out to it. */
@@ -798,10 +890,26 @@ async function rateLimitPut(
   await caches.default.put(rateLimitURL(prefix, token), res);
 }
 
-async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Response> {
+type TestResult = "sent" | "recent" | "failed";
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status, headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}
+
+/** Any accepted send wins; otherwise a deduplicated test is a 200 with an explicit reason. */
+function testResponse(results: TestResult[]): Response {
+  const delivered = results.filter((result) => result === "sent").length;
+  if (delivered > 0) return jsonResponse({ ok: true, delivered });
+  if (results.includes("recent")) return jsonResponse({ ok: true, delivered: 0, reason: "test_recently_sent" });
+  return new Response("APNs test delivery failed", { status: 502 });
+}
+
+async function runTest(token: string, sandbox: boolean, env: Env): Promise<TestResult> {
   const lastTest = await rateLimitGet("test", token);
   if (lastTest) {
-    return new Response("OK", { status: 200 });
+    return "recent";
   }
   await rateLimitPut("test", token, String(Date.now()), 60);
 
@@ -817,9 +925,34 @@ async function handleTest(token: string, sandbox: boolean, env: Env): Promise<Re
     source: "cloudflare-relay-test",
   };
 
-  return await sendAPNs(token, payload, sandbox, env)
-    ? new Response("OK", { status: 200 })
-    : new Response("APNs test delivery failed", { status: 502 });
+  return await sendAPNs(token, payload, sandbox, env) ? "sent" : "failed";
+}
+
+// --- Notify response (relay-facing; contains no tokens, ids or camera names) ---
+
+export type PublicOutcome = "sent" | "rate_limited" | "duplicate" | "filtered" | "cooldown" | "failed";
+
+function publicResult(result: DeliveryResult): { outcome: PublicOutcome; reason: string } {
+  return result.outcome === "dead"
+    ? { outcome: "failed", reason: "apns_token_invalid" }
+    : { outcome: result.outcome, reason: result.reason };
+}
+
+/** Request ended before fan-out on purpose: terminal, nothing to retry. */
+function notifySkipped(reason: string): Response {
+  return jsonResponse({ ok: true, delivered: 0, suppressed: 0, outcomes: [], reason });
+}
+
+/**
+ * HTTP 200 for every terminal outcome (relay 1.2.1 retries any non-2xx, which
+ * could duplicate alerts); 502 only when at least one APNs send failed.
+ */
+function notifyResponse(results: DeliveryResult[]): Response {
+  const outcomes = results.map(publicResult);
+  const delivered = outcomes.filter((entry) => entry.outcome === "sent").length;
+  const failed = outcomes.filter((entry) => entry.outcome === "failed").length;
+  const ok = failed === 0;
+  return jsonResponse({ ok, delivered, suppressed: outcomes.length - delivered - failed, outcomes }, ok ? 200 : 502);
 }
 
 /** Critical presentation requires an authenticated policy decision. */
@@ -836,7 +969,7 @@ async function handleNotify(
   if (!parsed.ok) return parsed.response;
   const normalized = normalizeNotifyBody(parsed.value);
   if (normalized === "drop") {
-    return new Response("OK", { status: 200 });
+    return notifySkipped("review_ended");
   }
   const event: DeliveryEvent | null = normalized ?? legacyObject(parsed.value);
   if (!event) {
@@ -844,7 +977,7 @@ async function handleNotify(
   }
 
   if (route.cam && event.camera !== route.cam) {
-    return new Response("OK", { status: 200 });
+    return notifySkipped("camera_not_selected");
   }
 
   const policyChannelID = /^[0-9a-f]{64}$/i.test(route.secret) ? route.secret.toLowerCase() : null;
@@ -872,7 +1005,7 @@ async function handleNotify(
     Object.assign(event, decision);
     if (decision.presentation.disposition === "suppress") {
       await writeAutomationCooldown(route.secret.toLowerCase(), cooldownState, env);
-      return new Response("Suppressed by automation policy", { status: 200 });
+      return notifySkipped("suppressed_by_automation_policy");
     }
   }
 
@@ -920,8 +1053,7 @@ async function handleNotify(
   if (maxAge > 0) {
     const ageSeconds = Date.now() / 1000 - event.detected_at;
     if (ageSeconds > maxAge || ageSeconds < -30) {
-
-      return new Response("OK", { status: 200 });
+      return notifySkipped("stale_event");
     }
   }
 
@@ -937,7 +1069,8 @@ async function handleNotify(
   });
 
   // Build APNs payload
-  const cameraName = event.camera.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  const cameraName = (isCorrelatedReview(event) ? event.camera_display_name : undefined)
+    ?? event.camera.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   const label = event.label.replace(/\b\w/g, (c) => c.toUpperCase());
 
   const bodyParts: string[] = [];
@@ -991,6 +1124,8 @@ async function handleNotify(
       decisionMAC: event.decisionMAC,
     } : {}),
     camera: event.camera,
+    ...(isCorrelatedReview(event) && event.camera_display_name
+      ? { camera_display_name: event.camera_display_name } : {}),
     label: event.label,
     zones: event.zones || [],
     // Forwarded so the NSE rules engine can evaluate scoreAtLeast and
@@ -1040,8 +1175,9 @@ async function handleNotify(
 
   // Phase 1 fan-out: look up all devices registered under this secret. If the
   // user has registered via POST /v1/register (iPhone + iPad + Mac + Watch...),
-  // fan out to every one in parallel. Each device has its own 30s rate-limit
-  // bucket so one spammy camera doesn't block a new device from receiving.
+  // fan out to every one in parallel. Each device has its own per-camera
+  // rate-limit bucket so one spammy camera blocks neither another device nor
+  // another camera.
   //
   // If no devices are registered (pre-fan-out client still using the single
   // URL token), fall back to that URL token so existing setups keep working.
@@ -1059,16 +1195,20 @@ async function handleNotify(
   // prevent repeat sends after a known successful acceptance.
   const collapseId = await channelIDForSecret(JSON.stringify(isCorrelatedReview(event) ? [route.secret, event.reviewId, event.reviewSeverity] : [route.secret, "legacy", event.eventId]));
 
+  // Rate-limit bucket is per APNs token AND camera: one camera's burst never
+  // hides another camera's alert (two cameras 2.6 s apart must both arrive).
+  const rateLimitScope = event.camera.trim().toLowerCase();
   const deliveryOutcomes = await Promise.all(
     targets.map(async (device) => {
-      if (deliveryFilterDecision(device.filterPolicy, { ...event, reviewSeverity: event.reviewSeverity ?? "legacy" })) return "duplicate" as DeliveryOutcome;
+      const filtered = deliveryFilterDecision(device.filterPolicy, { ...event, reviewSeverity: event.reviewSeverity ?? "legacy" });
+      if (filtered) return { outcome: "filtered", reason: filtered } as DeliveryResult;
       const filter = device.filterPolicy && !device.filterPolicy.isPassthrough
         ? (device.filterPolicy.cameras[event.camera] ?? device.filterPolicy.globalDefaults) : undefined;
       const cooldownKey = `delivery-filter-cooldown:${await channelIDForSecret(JSON.stringify([device.token, event.camera, event.label]))}`;
       if (filter && filter.cooldownSeconds > 0 && !event.isEnrichment) {
         const last = Number(await env.RATE_LIMIT.get(cooldownKey));
         if (Number.isFinite(last) && last > 0 && Date.now() / 1000 - last < filter.cooldownSeconds) {
-          return "duplicate" as DeliveryOutcome;
+          return { outcome: "cooldown", reason: "camera_label_cooldown" } as DeliveryResult;
         }
       }
       const payload = structuredClone(apnsPayload);
@@ -1077,48 +1217,47 @@ async function handleNotify(
         aps["interruption-level"] = "time-sensitive";
         aps.sound = "default";
       }
-      const outcome = await sendToDeviceRateLimited(device, payload, env, priority, collapseId, event.isEnrichment === true);
-      if (outcome === "sent" && filter && filter.cooldownSeconds > 0 && !event.isEnrichment) {
+      const result = await sendToDeviceRateLimited(device, payload, env, priority, collapseId, event.isEnrichment === true, rateLimitScope);
+      if (result.outcome === "sent" && filter && filter.cooldownSeconds > 0 && !event.isEnrichment) {
         await env.RATE_LIMIT.put(cooldownKey, String(Date.now() / 1000), { expirationTtl: Math.max(60, filter.cooldownSeconds) });
       }
-      return outcome;
+      return result;
     })
   );
-  const deadTokens = new Set(targets.filter((_, index) => deliveryOutcomes[index] === "dead").map((device) => device.token));
+  const deadTokens = new Set(targets.filter((_, index) => deliveryOutcomes[index].outcome === "dead").map((device) => device.token));
   if (deadTokens.size > 0 && registered.length > 0) {
     await writeDevices(route.secret, registered.filter((device) => !deadTokens.has(device.token)), env);
   }
-  const terminalDelivery = deliveryOutcomes.every((outcome) => outcome === "sent" || outcome === "rate_limited" || outcome === "duplicate");
+  const terminalDelivery = deliveryOutcomes.every((result) => result.outcome !== "failed" && result.outcome !== "dead");
   if (channelPolicy && cooldownState && terminalDelivery) {
     await writeAutomationCooldown(route.secret.toLowerCase(), cooldownState, env);
   }
 
-  return terminalDelivery
-    ? new Response("OK", { status: 200 })
-    : new Response("APNs delivery failed", { status: 502 });
+  return notifyResponse(deliveryOutcomes);
 }
 
 /**
- * Send the APNs payload to one device, honouring a per-token 30s rate limit.
+ * Send the APNs payload to one device, honouring a per-token, per-camera rate limit.
  * Returns a typed outcome so the request boundary can distinguish intentional
  * rate limiting from an actual APNs failure. One failing device still does not
  * block successful targets in the same Promise.all fan-out.
  */
-export type DeliveryOutcome = "sent" | "rate_limited" | "duplicate" | "failed" | "dead";
+export type DeliveryOutcome = "sent" | "rate_limited" | "duplicate" | "filtered" | "cooldown" | "failed" | "dead";
+export interface DeliveryResult { outcome: DeliveryOutcome; reason: string }
 
 // Coalesce simultaneous retries in one isolate. Persisted receipts cover
 // later retries; cross-region exactly-once delivery is not provided by KV.
-const inFlightDeliveries = new Map<string, Promise<DeliveryOutcome>>();
+const inFlightDeliveries = new Map<string, Promise<DeliveryResult>>();
 async function sendToDeviceRateLimited(
   device: RegisteredDevice, payload: unknown, env: Env,
-  priority = 10, collapseId?: string, enrichment = false,
-): Promise<DeliveryOutcome> {
-  if (!collapseId) return deliverToDevice(device, payload, env, priority, collapseId, enrichment);
+  priority = 10, collapseId?: string, enrichment = false, rateLimitScope = "",
+): Promise<DeliveryResult> {
+  if (!collapseId) return deliverToDevice(device, payload, env, priority, collapseId, enrichment, rateLimitScope);
   const key = JSON.stringify([env.APNS_BUNDLE_ID, device.token, device.sandbox, collapseId, enrichment]);
   const existing = inFlightDeliveries.get(key);
   if (existing) return existing;
-  if (inFlightDeliveries.size >= 4096) return "failed";
-  const delivery = deliverToDevice(device, payload, env, priority, collapseId, enrichment);
+  if (inFlightDeliveries.size >= 4096) return { outcome: "failed", reason: "worker_busy" };
+  const delivery = deliverToDevice(device, payload, env, priority, collapseId, enrichment, rateLimitScope);
   inFlightDeliveries.set(key, delivery);
   try { return await delivery; }
   finally { inFlightDeliveries.delete(key); }
@@ -1131,18 +1270,21 @@ async function deliverToDevice(
   priority: number = 10,
   collapseId?: string,
   enrichment = false,
-): Promise<DeliveryOutcome> {
+  rateLimitScope = "",
+): Promise<DeliveryResult> {
   // Per-device receipts keep retries from re-alerting devices that already
   // succeeded during partial fan-out. KV is eventually consistent; the relay's
   // persisted Review dedupe remains the primary authority across regions.
   const receipt = collapseId ? `review-delivered:${device.token}:${collapseId}` : null;
   const deliveryKey = receipt ? `${receipt}:${enrichment ? "enrichment" : "initial"}` : null;
   if (enrichment && receipt && !await env.RATE_LIMIT.get(`${receipt}:initial`)) {
-    return "duplicate"; // A correction must never create a previously suppressed alert.
+    // A correction must never create a previously suppressed alert.
+    return { outcome: "duplicate", reason: "enrichment_without_initial_alert" };
   }
-  if (deliveryKey && await env.RATE_LIMIT.get(deliveryKey)) return "duplicate";
-  // Per-device rate limit: 5s minimum gap between pushes to the same
-  // APNs token. Was 30s — too aggressive for security cameras where
+  if (deliveryKey && await env.RATE_LIMIT.get(deliveryKey)) return { outcome: "duplicate", reason: "already_delivered" };
+  // Per-device, per-camera rate limit: 5s minimum gap between pushes to the
+  // same APNs token for the same camera (keyed token + normalized camera, so
+  // a second camera firing 2.6 s later is never swallowed). Was 30s — too aggressive for security cameras where
   // a single intrusion can fire 5+ legitimate events in <30s. Users
   // were perceiving 30s+ latency because the FIRST event hit, the
   // rate-limit blocked the next 5 detections, and they only saw the
@@ -1153,22 +1295,26 @@ async function deliverToDevice(
   // Override via env.RATE_LIMIT_SECONDS for deployments that want a
   // different cadence.
   const minIntervalSeconds = strictBoundedInteger(env.RATE_LIMIT_SECONDS, 5, 0, 3_600);
-  const lastPush = await rateLimitGet("rl", device.token);
+  const rateLimitKey = `${device.token}:${rateLimitScope}`;
+  const lastPush = await rateLimitGet("rl", rateLimitKey);
   if (lastPush && !enrichment) {
     const elapsed = (Date.now() - parseInt(lastPush)) / 1000;
     if (elapsed < minIntervalSeconds) {
-
-      return "rate_limited";
+      return { outcome: "rate_limited", reason: "same_camera_within_rate_limit" };
     }
   }
   const result = await sendAPNsDetailed(device.token, payload, device.sandbox, env, priority, collapseId);
   const delivered = result.ok;
-  const outcome: DeliveryOutcome = delivered ? "sent" : (isDeadTokenResponse(result.status, result.reason) ? "dead" : "failed");
+  const outcome: DeliveryResult = delivered
+    ? { outcome: "sent", reason: "apns_accepted" }
+    : isDeadTokenResponse(result.status, result.reason)
+      ? { outcome: "dead", reason: "apns_token_invalid" }
+      : { outcome: "failed", reason: result.status === 0 ? "apns_unreachable" : `apns_status_${result.status}` };
   if (delivered) {
     if (deliveryKey) await env.RATE_LIMIT.put(deliveryKey, "1", { expirationTtl: 86400 });
     // A failed attempt must remain retryable. Consuming the rate-limit token
     // before APNs accepts the request silently loses the relay retry.
-    if (!enrichment) await rateLimitPut("rl", device.token, String(Date.now()), 60);
+    if (!enrichment) await rateLimitPut("rl", rateLimitKey, String(Date.now()), 60);
   }
 
   return outcome;

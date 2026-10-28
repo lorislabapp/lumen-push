@@ -57,7 +57,7 @@ describe("push v2", () => {
       }
     ), env);
     expect(response.status).toBe(200);
-    expect(await response.text()).toBe("OK");
+    expect(await response.json()).toEqual({ ok: true, delivered: 0, suppressed: 0, outcomes: [], reason: "stale_event" });
   });
 
   it("registers an APNs token in the body with bearer authentication", async () => {
@@ -199,7 +199,7 @@ describe("push v2", () => {
       method: "POST", body: JSON.stringify(envelope),
     }), env);
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("Suppressed");
+    expect(await response.json()).toMatchObject({ ok: true, delivered: 0, reason: "suppressed_by_automation_policy" });
     expect(await devices.get(`automation-cooldown:${channel}`)).toContain("rule-suppress");
   });
 });

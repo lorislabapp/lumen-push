@@ -20,7 +20,7 @@ lumen-push-relay (this is a small container you run on your network)
 Cloudflare Worker (this repo)
       |  1. Validates the Review schema and freshness
       |  2. Server-side filters (stationary, top_score < 0.5)
-      |  3. Rate limits: 30s per device token (Cloudflare KV)
+      |  3. Rate limits: 5s per device token + camera (Cache API)
       |  4. Signs APNs JWT (ES256, cached 50min)
       |  5. Delivers to Apple APNs with 1h expiration retry
       v
@@ -45,7 +45,7 @@ User sees notification (typically <1s end-to-end)
 ## Privacy & Security
 
 - **No notification usage analytics.** No per-device/camera/country statistics, analytics dashboard, scheduled digest or delivery-history record. Application code does not log camera/event names or raw APNs/transport errors. Worker observability is disabled in the checked-in deployment configuration; infrastructure handling remains governed by Cloudflare and Apple.
-- **Functional storage.** APNs registrations remain until unregistration or invalid-token pruning; no automatic expiry is asserted. Automation policy and cooldown state support user rules. Oversized notification snapshots expire within one hour and are removed on retrieval. Rate-limit state is short-lived; delivery-deduplication receipts in the development source expire within one day.
+- **Functional storage.** APNs registrations remain until unregistration or invalid-token pruning; no automatic expiry is asserted. Automation policy and cooldown state support user rules. Oversized notification snapshots expire within one hour and are removed on retrieval. Rate-limit state is short-lived; delivery-deduplication receipts in the development source expire within one day. An optional last-notify diagnostic (`LAST_NOTIFY_RETENTION="1"`, **off by default**) keeps one record per channel — HTTP status, Worker reason code and time, no camera/label/event/token/user agent — for 30 days so the in-app Push Doctor can show the last relay contact; enabling it changes the statement above and must be disclosed first.
 - **Credentials.** v2 registration uses a bearer secret and hashed channel identifier. Legacy v1 URLs contain credentials: never log or share them. This Worker is not offline or zero-collection.
 - **APNs JWT signing.** The worker signs requests using Apple's ES256 (P-256 ECDSA) algorithm. The APNs private key is stored as a Cloudflare encrypted secret, never accessible in code.
 - **Source-tagged.** All notifications include `"source": "cloudflare-relay"` in the payload, so the Lumen app can identify and deduplicate them against local WebSocket notifications.
@@ -74,14 +74,23 @@ Custom producers may POST to this endpoint only if they implement the validated 
   "label": "person",
   "detected_at": 1710756000.123,
   "score": 0.87,
-  "zones": ["porch"]
+  "zones": ["porch"],
+  "camera_display_name": "Back Porch"
 }
 ```
+
+`camera_display_name` is optional: control/bidi characters are stripped, whitespace collapsed, and the value capped at 64 characters. When present it replaces the prettified camera id in the alert subtitle and is forwarded as `camera_display_name`; when absent or unusable the payload is unchanged.
+
+**Response:** always HTTP 200 for a terminal outcome (relays retry non-2xx), 502 only if an APNs send failed. Body:
+```json
+{"ok":true,"delivered":1,"suppressed":1,"outcomes":[{"outcome":"sent","reason":"apns_accepted"},{"outcome":"rate_limited","reason":"same_camera_within_rate_limit"}]}
+```
+`outcome` is one of `sent`, `rate_limited`, `duplicate`, `filtered`, `cooldown`, `failed`; no tokens, ids or camera names are returned. Requests that end before fan-out return `outcomes: []` with a `reason` (`stale_event`, `camera_not_selected`, `review_ended`, `suppressed_by_automation_policy`).
 
 **Filtering (server-side):**
 - Missing/malformed Review authority is rejected before APNs
 - Stale events and camera-route mismatches are rejected
-- Rate limiting is applied per device token
+- Rate limiting is applied per device token and camera (5 s default, `RATE_LIMIT_SECONDS`); another camera is never throttled
 - Signed Automation V4 decisions are accepted only when their MAC and active policy revision/hash match; suppression never calls APNs
 
 ### `PUT /v2/channels/<channel-id>/automation-policy`
@@ -121,7 +130,7 @@ state when no always-on rule remains.
 
 ### `POST /v1/test/<secret>/<device_token>`
 
-Sends a test push notification. Rate limited to 1 per 60 seconds per device token.
+Sends a test push notification. Rate limited to 1 per 60 seconds per device token; a repeat inside that window returns `200 {"ok":true,"delivered":0,"reason":"test_recently_sent"}` (`POST /v2/channels/<id>/test` behaves the same and returns `{"ok":true,"delivered":n}` on success).
 
 ## Self-hosting
 

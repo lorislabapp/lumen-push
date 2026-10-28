@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { channelIDForSecret, type Env } from "../src/index";
+import worker, { channelIDForSecret, sanitizeCameraDisplayName, type Env } from "../src/index";
 import relayFixture from "./fixtures/relay-generated-review.json";
 class KV {
   values = new Map<string,string>();
@@ -152,5 +152,138 @@ describe("device filtering before APNs",()=>{
     expect(fetch).toHaveBeenCalledTimes(1);
     const payload=JSON.parse(fetch.mock.calls[0][1]!.body as string);
     expect(payload.aps["interruption-level"]).not.toBe("critical");
+  });
+});
+
+describe("per-camera rate limit and relay-facing outcomes",()=>{
+  const second="cd".repeat(32);
+  const at=(ms:number)=>vi.setSystemTime(new Date(1_800_000_000_000+ms));
+  afterEach(()=>vi.useRealTimers());
+  async function limited(tokens=[token]) {
+    vi.useFakeTimers({toFake:["Date"]}); at(0);
+    const result=await setup(tokens);
+    result.env.RATE_LIMIT_SECONDS="5";
+    return result;
+  }
+  it("delivers two cameras 2.6 s apart to both phones",async()=>{
+    const {send,fetch}=await limited([token,second]);
+    const walkway=await send(envelope({camera:"main_walkway",reviewId:"r-walkway",eventId:"e-walkway",label:"person"}));
+    at(2_600);
+    const porch=await send(envelope({camera:"back_porch",reviewId:"r-porch",eventId:"e-porch",label:"person"}));
+    expect(walkway.status).toBe(200);
+    expect(porch.status).toBe(200);
+    expect(await walkway.json()).toMatchObject({ok:true,delivered:2,suppressed:0});
+    expect(await porch.json()).toMatchObject({ok:true,delivered:2,suppressed:0});
+    expect(fetch).toHaveBeenCalledTimes(4);
+    const subtitles=fetch.mock.calls.map(call=>JSON.parse(call[1]!.body as string).aps.alert.subtitle);
+    expect(subtitles.filter(s=>s==="Back Porch")).toHaveLength(2);
+  });
+  it("still suppresses the same camera inside the window, then releases it",async()=>{
+    const {send,fetch}=await limited();
+    expect(await (await send(envelope({reviewId:"r1"}))).json()).toMatchObject({delivered:1});
+    at(2_600);
+    const again=await send(envelope({reviewId:"r2",eventId:"car-2",camera:" SWANN_CH16 "}));
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual({ok:true,delivered:0,suppressed:1,outcomes:[{outcome:"rate_limited",reason:"same_camera_within_rate_limit"}]});
+    expect(fetch).toHaveBeenCalledTimes(1);
+    at(5_100);
+    expect(await (await send(envelope({reviewId:"r3",eventId:"car-3"}))).json()).toMatchObject({delivered:1});
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  it("returns a closed JSON shape with no token, id or camera",async()=>{
+    const {send,fetch}=await limited([token,second]);
+    // Fail the second phone by URL: concurrent fan-out order is not deterministic.
+    fetch.mockImplementation(async(url:unknown)=>new Response(null,{status:String(url).includes(second)&&fetch.mock.calls.length<=2?503:200}));
+    const response=await send(envelope({reviewId:"shape",eventId:"shape-event"}));
+    expect(response.status).toBe(502);
+    expect(response.headers.get("content-type")).toBe("application/json");
+    const text=await response.text();
+    for(const secretish of [token,second,"shape","swann",secret]) expect(text.toLowerCase()).not.toContain(secretish);
+    const body=JSON.parse(text);
+    expect(Object.keys(body).sort()).toEqual(["delivered","ok","outcomes","suppressed"]);
+    expect(body).toEqual({ok:false,delivered:1,suppressed:0,outcomes:[{outcome:"sent",reason:"apns_accepted"},{outcome:"failed",reason:"apns_status_503"}]});
+    const retry=await send(envelope({reviewId:"shape",eventId:"shape-event"}));
+    expect(await retry.json()).toEqual({ok:true,delivered:1,suppressed:1,outcomes:[{outcome:"duplicate",reason:"already_delivered"},{outcome:"sent",reason:"apns_accepted"}]});
+  });
+  it("answers a repeated test within 60 s with an explicit reason",async()=>{
+    const {channel,env,fetch}=await limited();
+    const test=()=>worker.fetch(new Request(`https://push.test/v2/channels/${channel}/test`,{method:"POST",headers:{Authorization:`Bearer ${secret}`}}),env);
+    expect(await (await test()).json()).toEqual({ok:true,delivered:1});
+    const again=await test();
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual({ok:true,delivered:0,reason:"test_recently_sent"});
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("camera display name",()=>{
+  it("sanitizes and bounds the name",()=>{
+    expect(sanitizeCameraDisplayName("  Back\u0000 Porch‮\n ")).toBe("Back Porch");
+    expect(sanitizeCameraDisplayName("x".repeat(100))).toBe("x".repeat(64));
+    expect(sanitizeCameraDisplayName("\u0007\t ")).toBeUndefined();
+    expect(sanitizeCameraDisplayName(42)).toBeUndefined();
+    expect(sanitizeCameraDisplayName("y".repeat(2000))).toBeUndefined();
+  });
+  it("uses the sanitized name for the alert and forwards it to the extension",async()=>{
+    const {send,fetch}=await setup();
+    expect((await send(envelope({camera_display_name:"  Back\u0007 Porch‮ "}))).status).toBe(200);
+    const payload=JSON.parse(fetch.mock.calls[0][1]!.body as string);
+    expect(payload.aps.alert.subtitle).toBe("Back Porch");
+    expect(payload.camera_display_name).toBe("Back Porch");
+    expect(payload.camera).toBe("swann_ch16");
+    expect(payload.aps["thread-id"]).toBe("swann_ch16");
+  });
+  it("accepts the snake_case relay shape",async()=>{
+    const {send,fetch}=await setup();
+    const raw={type:"new",after:{id:"e1",camera:"back_porch",label:"person",top_score:.9,start_time:Date.now()/1000,source_schema:"frigate-review-v1",review_id:"r1",review_severity:"alert",camera_display_name:"Porche arrière"}};
+    expect((await send(raw)).status).toBe(200);
+    const payload=JSON.parse(fetch.mock.calls[0][1]!.body as string);
+    expect(payload.aps.alert.subtitle).toBe("Porche arrière");
+  });
+  it("falls back to the prettified id when the name is unusable, still alerting",async()=>{
+    const {send,fetch}=await setup();
+    expect((await send(envelope({camera_display_name:123}))).status).toBe(200);
+    const payload=JSON.parse(fetch.mock.calls[0][1]!.body as string);
+    expect(payload.aps.alert.subtitle).toBe("Swann Ch16");
+    expect("camera_display_name" in payload).toBe(false);
+  });
+  it("leaves an old payload's APNs body unchanged",async()=>{
+    const {send,fetch}=await setup();
+    expect((await send(envelope())).status).toBe(200);
+    const payload=JSON.parse(fetch.mock.calls[0][1]!.body as string);
+    expect(Object.keys(payload)).toEqual(["aps","eventId","sourceSchema","reviewId","reviewSeverity","camera","label","zones","top_score","stationary","isEnrichment","detected_at","source","classification"]);
+    expect(payload.aps.alert).toEqual({title:"Car Detected",subtitle:"Swann Ch16",body:"Confidence: 75%"});
+  });
+});
+
+describe("last notify record (opt-in)",()=>{
+  const statusOf=async(env:Env,channel:string)=>(await worker.fetch(new Request(`https://push.test/v2/channels/${channel}/status`,{headers:{Authorization:`Bearer ${secret}`}}),env)).json() as Promise<Record<string,any>>;
+  it("keeps nothing by default",async()=>{
+    const {env,channel,send}=await setup();
+    await send(envelope());
+    expect([...(env.DEVICES as unknown as KV).values.keys()].some(k=>k.startsWith("last-notify:"))).toBe(false);
+    expect(await statusOf(env,channel)).toMatchObject({lastNotify:null,deliveryHistoryRetained:false});
+  });
+  it("when enabled, stores one minimal record and writes at most once a minute",async()=>{
+    const {env,channel,send}=await setup();
+    env.LAST_NOTIFY_RETENTION="1";
+    const kv=env.DEVICES as unknown as KV;
+    const put=vi.spyOn(kv,"put");
+    await send(envelope());
+    await send(envelope({reviewId:"r-2",camera:"other"}));
+    expect(put.mock.calls.filter(([k])=>k.startsWith("last-notify:"))).toHaveLength(1);
+    const record=kv.values.get(`last-notify:${channel}`)!;
+    expect(Object.keys(JSON.parse(record)).sort()).toEqual(["at","reason","status"]);
+    expect(record).not.toContain("swann");
+    const status=await statusOf(env,channel);
+    expect(status.deliveryHistoryRetained).toBe(true);
+    expect(status.lastNotify).toMatchObject({status:200,reason:"delivered",userAgent:null});
+  });
+  it("never creates a record for a channel with no device",async()=>{
+    const {env}=await setup();
+    env.LAST_NOTIFY_RETENTION="1";
+    const empty=await channelIDForSecret("34".repeat(16));
+    await worker.fetch(new Request(`https://push.test/v2/notify/${empty}`,{method:"POST",body:JSON.stringify(envelope())}),env);
+    expect((env.DEVICES as unknown as KV).values.has(`last-notify:${empty}`)).toBe(false);
   });
 });
