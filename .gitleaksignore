@@ -1,0 +1,8 @@
+# Synthetic channel capabilities used only by local tests. Exact fingerprints
+# ensure new or moved findings still fail the scan.
+test/index.test.ts:generic-api-key:65
+test/index.test.ts:generic-api-key:84
+test/index.test.ts:generic-api-key:131
+test/index.test.ts:generic-api-key:179
+test/index.test.ts:generic-api-key:277
+test/index.test.ts:generic-api-key:658

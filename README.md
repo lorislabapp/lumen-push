@@ -2,7 +2,7 @@
 
 Open-source Cloudflare Worker that relays [Frigate NVR](https://github.com/blakeblackshear/frigate) detection events to Apple Push Notifications for [Lumen for Frigate](https://apps.apple.com/app/id6760238729).
 
-**No server to manage. No database. No persistent storage.** A stateless Cloudflare Worker that signs APNs JWTs and delivers pushes in under 1 second.
+**No server to manage.** A Cloudflare Worker that signs APNs requests and delivers notifications. Delivery registrations, automation configuration and temporary functional state are persisted; notification usage analytics are not collected by this code.
 
 ## Architecture
 
@@ -40,14 +40,13 @@ User sees notification (typically <1s end-to-end)
 3. The Worker validates, rate limits, signs an APNs JWT, and delivers the push to Apple.
 4. Your iPhone / iPad / Mac / Watch / Apple TV / Vision Pro receives the notification via Lumen.
 
-> **Why two pieces?** Frigate publishes events over MQTT but does not send HTTP webhooks natively, so something has to subscribe to MQTT and forward to HTTPS. We split the work: the relay is tiny and stays on your network (sees your MQTT), the Worker is stateless and holds the APNs key (signs and delivers). Only the compact notification payload (camera, label, zone, confidence) leaves your network.
+> **Why two pieces?** Frigate publishes events over MQTT but does not send HTTP webhooks natively, so something has to subscribe to MQTT and forward to HTTPS. We split the work: the relay is tiny and stays on your network (sees your MQTT), the Worker holds delivery registrations and the APNs key (signs and delivers). Only the compact notification payload (camera, label, zone, confidence) leaves your network.
 
 ## Privacy & Security
 
-- **No data stored.** The worker is stateless. The only KV writes are rate-limit timestamps (TTL: 120s, auto-deleted).
-- **No accounts.** There is no user database, no registration, no tracking.
-- **No logging.** Request bodies are not logged. Only APNs errors are logged to Cloudflare console.
-- **URL-based security.** The webhook URL contains a 128-bit random secret generated on-device. The secret never leaves your device and Frigate instance. An attacker would need to guess a 32-character hex string (2^128 combinations) to send a push to your device.
+- **No notification usage analytics.** No per-device/camera/country statistics, analytics dashboard, scheduled digest or delivery-history record. Application code does not log camera/event names or raw APNs/transport errors. Worker observability is disabled in the checked-in deployment configuration; infrastructure handling remains governed by Cloudflare and Apple.
+- **Functional storage.** APNs registrations remain until unregistration or invalid-token pruning; no automatic expiry is asserted. Automation policy and cooldown state support user rules. Oversized notification snapshots expire within one hour and are removed on retrieval. Rate-limit state is short-lived; delivery-deduplication receipts in the development source expire within one day.
+- **Credentials.** v2 registration uses a bearer secret and hashed channel identifier. Legacy v1 URLs contain credentials: never log or share them. This Worker is not offline or zero-collection.
 - **APNs JWT signing.** The worker signs requests using Apple's ES256 (P-256 ECDSA) algorithm. The APNs private key is stored as a Cloudflare encrypted secret, never accessible in code.
 - **Source-tagged.** All notifications include `"source": "cloudflare-relay"` in the payload, so the Lumen app can identify and deduplicate them against local WebSocket notifications.
 
@@ -191,3 +190,10 @@ MIT
 - [lumen-push-relay](https://github.com/lorislabapp/lumen-push-relay) — MQTT→Worker bridge (the thing most users need to run)
 - [Frigate NVR](https://github.com/blakeblackshear/frigate) — Open-source AI-powered NVR
 - [LorisLabs](https://lorislab.fr) — Developer website
+
+
+## Device delivery filters (v1)
+
+New app versions can register an allowlisted per-device delivery policy and its revision hash with the authenticated device registration. The acknowledgment confirms the revision stored by the service. Registered filters enforce labels, Frigate top_score, stationary/missing motion state and optional Review-alert-only selection before APNs. A configured cooldown is consumed only after APNs accepts a notification. Registrations and these settings remain until removal; they are functional configuration, not usage analytics. Device policies never contain full app settings, credentials or geolocation.
+
+Migration: old raw-object producers remain a compatibility path for devices that have not selected Review-only filtering. They are never relabelled as Review items, never assigned invented Review IDs or scores, and cannot authorize critical presentation. The Worker tags its APNs payloads consistently so client filtering cannot be bypassed by the producer's source label. Review-alert-only rejects raw legacy objects: upgrade the local relay to its correlated Review contract before enabling that option. The old producer path is not evidence that an event appears in Frigate Review. New Review decisions continue to use producer-side persistent deduplication; Worker KV receipts/cooldowns are eventually consistent and do not promise global exactly-once delivery.

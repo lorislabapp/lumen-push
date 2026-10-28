@@ -3,16 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 account_id = "4c3e2b246dc1b838e47ed33cbbe3a39c"
 
-# Plain (non-secret) vars. The account ID is already in any wrangler URL
-# and is not a secret. STATS_TOKEN, CF_ANALYTICS_TOKEN and the optional
-# SLACK_WEBHOOK_URL go through `wrangler secret put` instead.
-[vars]
-CF_ACCOUNT_ID = "4c3e2b246dc1b838e47ed33cbbe3a39c"
+# No per-event analytics, scheduled exports or request/console logging.
+[observability]
+enabled = false
 
-# Daily Slack digest at 08:00 UTC (09:00 Paris winter, 10:00 summer).
-# scheduled() handler no-ops if SLACK_WEBHOOK_URL secret is unset.
 [triggers]
-crons = ["0 8 * * *"]
+crons = []
 
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
@@ -21,10 +17,3 @@ id = "103f9f605ffa41588382f0537b8c55ae"
 [[kv_namespaces]]
 binding = "DEVICES"
 id = "505b10887ac844338b94b7340906865e"
-
-# Per-user / per-country notification stats. Workers Analytics Engine is
-# included in the Workers Paid plan: 25M writes/mo + 1M reads/mo. At our
-# scale (~18k notifs/mo) we're 1000x under the quota.
-[[analytics_engine_datasets]]
-binding = "NOTIF_STATS"
-dataset = "lumen_push_notif_stats"
